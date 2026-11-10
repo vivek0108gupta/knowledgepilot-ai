@@ -10,9 +10,12 @@
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "typecheck": "next typegen && tsc --noEmit",
-    "test": "node --test \"lib/**/*.test.ts\""
+    "test": "vitest run"
   },
   "dependencies": {
+    "@base-ui/react": "^1.9.0",
+    "@supabase/ssr": "^0.12.7",
+    "@supabase/supabase-js": "^2.119.0",
     "@tanstack/react-query": "^5.107.1",
     "next": "16.4.6",
     "react": "19.3.0",
@@ -21,13 +24,19 @@
   },
   "devDependencies": {
     "@tailwindcss/turbopack": "4.3.3",
-    "@types/node": "^20",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.9",
+    "@types/node": "^22.20.5",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "^6.3.0",
     "eslint": "^9",
     "eslint-config-next": "16.4.6",
+    "jsdom": "^29.1.1",
     "prettier": "^3.9.10",
     "tailwindcss": "4.3.3",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^5.1.0"
   }
 }

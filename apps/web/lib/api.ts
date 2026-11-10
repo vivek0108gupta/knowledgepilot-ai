@@ -30,26 +30,60 @@ export class ApiError extends Error {
   }
 }
 
+export interface ApiAuth {
+  /** The current access token, or null when signed out. */
+  getAccessToken: () => Promise<string | null>;
+  /** Called when the API rejects the token, so the app can end the session. */
+  onUnauthorized: () => void;
+}
+
+let apiAuth: ApiAuth | null = null;
+
+/** Connects the client to the auth session. Set once by `AuthProvider`; pass null to disconnect. */
+export function configureApiAuth(auth: ApiAuth | null): void {
+  apiAuth = auth;
+}
+
+export interface ApiRequest {
+  method?: "GET" | "POST" | "PATCH" | "DELETE";
+  /** Sent as JSON. */
+  body?: unknown;
+  signal?: AbortSignal;
+}
+
 /**
  * Calls a `/api/v1` endpoint and returns its JSON body, checked against `schema`.
+ * Sends the session's access token when there is one. The API works out who is calling from
+ * that token alone, so this client never sends a user ID to identify the caller.
  * Always rejects with an `ApiError`, except when the caller aborts the request.
  */
-export async function apiFetch<T>(path: string, schema: z.ZodType<T>, init?: RequestInit): Promise<T> {
+export async function apiFetch<T>(path: string, schema: z.ZodType<T>, request: ApiRequest = {}): Promise<T> {
+  const { method = "GET", body: payload, signal } = request;
+
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (payload !== undefined) headers["Content-Type"] = "application/json";
+  const token = apiAuth ? await apiAuth.getAccessToken() : null;
+  if (token) headers.Authorization = `Bearer ${token}`;
+
   let response: Response;
   try {
     response = await fetch(`${API_V1}${path}`, {
-      ...init,
-      headers: { Accept: "application/json", ...init?.headers },
+      method,
+      headers,
+      body: payload === undefined ? undefined : JSON.stringify(payload),
+      signal,
     });
   } catch (cause) {
-    if (init?.signal?.aborted) throw cause;
+    if (signal?.aborted) throw cause;
     throw new ApiError(0, "network_error", "Could not reach the server.");
   }
 
-  const body: unknown = await response.json().catch(() => null);
+  const body: unknown = response.status === 204 ? undefined : await response.json().catch(() => null);
   const requestId = response.headers.get("X-Request-ID") ?? undefined;
 
   if (!response.ok) {
+    if (response.status === 401) apiAuth?.onUnauthorized();
+
     const envelope = errorEnvelopeSchema.safeParse(body);
     if (envelope.success) {
       const { code, message, request_id } = envelope.data.error;
@@ -76,12 +110,17 @@ export async function apiFetch<T>(path: string, schema: z.ZodType<T>, init?: Req
   return parsed.data;
 }
 
+/** A message safe to show a user for any thrown value. */
+export function errorMessage(error: unknown): string {
+  return error instanceof ApiError ? error.message : "Something went wrong. Please try again.";
+}
+
 export const healthSchema = z.object({ status: z.string() });
 export type Health = z.infer<typeof healthSchema>;
 
 export const readinessSchema = healthSchema.extend({ database: z.string(), pgvector: z.string() });
 export type Readiness = z.infer<typeof readinessSchema>;
 
-export const getHealth = (init?: RequestInit) => apiFetch("/health", healthSchema, init);
+export const getHealth = (signal?: AbortSignal) => apiFetch("/health", healthSchema, { signal });
 
-export const getReadiness = (init?: RequestInit) => apiFetch("/health/ready", readinessSchema, init);
+export const getReadiness = (signal?: AbortSignal) => apiFetch("/health/ready", readinessSchema, { signal });

@@ -24,6 +24,10 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-knowledgepilot}:${POSTGRES_PASSWORD:-knowledgepilot}@db:5432/${POSTGRES_DB:-knowledgepilot}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      # Supabase Auth: the API verifies access tokens against the project's public signing keys.
+      SUPABASE_URL: ${SUPABASE_URL:-}
+      SUPABASE_JWKS_URL: ${SUPABASE_JWKS_URL:-}
+      SUPABASE_ISSUER: ${SUPABASE_ISSUER:-}
     ports:
       - "${API_HOST_PORT:-8000}:8000"
     depends_on:
@@ -46,6 +50,8 @@ services:
       args:
         # The browser calls the API directly, so this is the host-facing URL.
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+        NEXT_PUBLIC_SUPABASE_URL: ${NEXT_PUBLIC_SUPABASE_URL:-}
+        NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY:-}
     ports:
       - "${WEB_HOST_PORT:-3000}:3000"
     depends_on:

@@ -11,11 +11,18 @@ from app.core.logging import request_id_var
 class AppError(Exception):
     """An expected failure with a stable, machine-readable code the frontend can branch on."""
 
-    def __init__(self, status_code: int, code: str, message: str) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
+        self.headers = headers
 
 
 def error_response(
@@ -38,7 +45,10 @@ def internal_error_response() -> JSONResponse:
 
 
 async def handle_app_error(_request: Request, error: AppError) -> JSONResponse:
-    return error_response(error.status_code, error.code, error.message)
+    response = error_response(error.status_code, error.code, error.message)
+    if error.headers:
+        response.headers.update(error.headers)
+    return response
 
 
 async def handle_http_exception(_request: Request, error: StarletteHTTPException) -> JSONResponse:
