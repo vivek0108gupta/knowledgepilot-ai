@@ -1,0 +1,63 @@
+from http import HTTPStatus
+
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+from app.core.logging import request_id_var
+
+
+class AppError(Exception):
+    """An expected failure with a stable, machine-readable code the frontend can branch on."""
+
+    def __init__(self, status_code: int, code: str, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.message = message
+
+
+def error_response(
+    status_code: int, code: str, message: str, details: list[dict[str, object]] | None = None
+) -> JSONResponse:
+    """Every error leaves the API in this one shape."""
+    error: dict[str, object] = {
+        "code": code,
+        "message": message,
+        "request_id": request_id_var.get(),
+    }
+    if details is not None:
+        error["details"] = details
+    return JSONResponse(status_code=status_code, content={"error": error})
+
+
+def internal_error_response() -> JSONResponse:
+    # Deliberately generic: the cause goes to the logs, never to the client.
+    return error_response(500, "internal_error", "Something went wrong on our side.")
+
+
+async def handle_app_error(_request: Request, error: AppError) -> JSONResponse:
+    return error_response(error.status_code, error.code, error.message)
+
+
+async def handle_http_exception(_request: Request, error: StarletteHTTPException) -> JSONResponse:
+    code = HTTPStatus(error.status_code).phrase.lower().replace(" ", "_")
+    response = error_response(error.status_code, code, str(error.detail))
+    if error.headers:
+        response.headers.update(error.headers)
+    return response
+
+
+async def handle_validation_error(_request: Request, error: RequestValidationError) -> JSONResponse:
+    details: list[dict[str, object]] = [
+        {"field": ".".join(str(part) for part in item["loc"]), "message": item["msg"]}
+        for item in error.errors()
+    ]
+    return error_response(422, "validation_error", "The request is invalid.", details)
+
+
+def register_error_handlers(app: FastAPI) -> None:
+    app.add_exception_handler(AppError, handle_app_error)  # type: ignore[arg-type]
+    app.add_exception_handler(StarletteHTTPException, handle_http_exception)  # type: ignore[arg-type]
+    app.add_exception_handler(RequestValidationError, handle_validation_error)  # type: ignore[arg-type]
