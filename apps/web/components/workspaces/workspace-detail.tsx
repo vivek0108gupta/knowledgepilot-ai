@@ -7,6 +7,7 @@ import { useState, type FormEvent } from "react";
 
 import { useAuth } from "@/components/auth/auth-provider";
 import { PageHeader } from "@/components/dashboard/shell";
+import { Documents } from "@/components/documents/documents";
 import { Button, buttonClass } from "@/components/ui/button";
 import { Alert, Badge, ErrorState, LoadingRegion, Skeleton } from "@/components/ui/feedback";
 import { SelectField, TextField } from "@/components/ui/field";
@@ -345,6 +346,7 @@ export function WorkspaceDetail() {
         }
       />
       <div className="flex flex-col gap-6">
+        <Documents workspace={data} />
         {canEditWorkspace(data.role) && (
           <Section title="General">
             <RenameForm workspace={data} />

@@ -1,8 +1,11 @@
+import logging
 import uuid
 
 from fastapi import APIRouter, Response, status
 
 from app.api.deps import CurrentUser, DbSession
+from app.api.v1.documents import StorageDep
+from app.core.errors import AppError
 from app.schemas.workspace import (
     MemberCreate,
     MemberOut,
@@ -10,8 +13,11 @@ from app.schemas.workspace import (
     WorkspaceOut,
     WorkspaceUpdate,
 )
+from app.services import documents as document_service
 from app.services import workspaces as service
 from app.services.workspaces import WorkspaceAccess
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/workspaces", tags=["workspaces"])
 
@@ -59,10 +65,18 @@ async def update_workspace(
 
 @router.delete("/{workspace_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_workspace(
-    workspace_id: uuid.UUID, user: CurrentUser, session: DbSession
+    workspace_id: uuid.UUID, user: CurrentUser, session: DbSession, storage_provider: StorageDep
 ) -> Response:
-    """Delete a workspace and its memberships. Owners only."""
-    await service.remove(session, workspace_id, user.id)
+    """Delete a workspace with its memberships, documents and stored files. Owners only."""
+    storage_paths = await service.remove(session, workspace_id, user.id)
+    if storage_paths:
+        # The workspace is gone either way; a storage failure here is logged, not returned.
+        try:
+            storage = storage_provider()
+        except AppError:
+            logger.error("Storage is not configured; %d file(s) left behind", len(storage_paths))
+        else:
+            await document_service.delete_stored_files(storage, storage_paths)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 

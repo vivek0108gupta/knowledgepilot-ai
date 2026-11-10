@@ -148,7 +148,7 @@ class TestDatabaseConstraints:
             pgvector = await connection.scalar(
                 text("SELECT extversion FROM pg_extension WHERE extname = 'vector'")
             )
-        assert version == "0002"
+        assert version == "0003"
         assert pgvector is not None
 
     async def test_duplicate_membership_is_rejected(self, db_engine: AsyncEngine) -> None:

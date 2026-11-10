@@ -28,6 +28,10 @@ services:
       SUPABASE_URL: ${SUPABASE_URL:-}
       SUPABASE_JWKS_URL: ${SUPABASE_JWKS_URL:-}
       SUPABASE_ISSUER: ${SUPABASE_ISSUER:-}
+      # Supabase Storage. The secret key is given to the API only, never to the web app.
+      SUPABASE_SECRET_KEY: ${SUPABASE_SECRET_KEY:-}
+      SUPABASE_STORAGE_BUCKET: ${SUPABASE_STORAGE_BUCKET:-knowledgepilot-documents}
+      SIGNED_URL_TTL_SECONDS: ${SIGNED_URL_TTL_SECONDS:-60}
     ports:
       - "${API_HOST_PORT:-8000}:8000"
     depends_on:

@@ -39,6 +39,9 @@ vi.mock("@/lib/workspaces", async (importOriginal) => ({
   removeMember: mocks.removeMember,
 }));
 
+// Documents have their own tests; here they would only add unrelated requests.
+vi.mock("@/components/documents/documents", () => ({ Documents: () => null }));
+
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: mocks.push, replace: mocks.replace }),
   useParams: () => ({ workspaceId: WORKSPACE_ID }),

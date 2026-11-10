@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import AppError
+from app.models.document import Document
 from app.models.workspace import Workspace, WorkspaceMember, WorkspaceRole
 
 OWNER = WorkspaceRole.OWNER
@@ -102,12 +103,20 @@ async def rename(
     return access
 
 
-async def remove(session: AsyncSession, workspace_id: uuid.UUID, user_id: uuid.UUID) -> None:
+async def remove(session: AsyncSession, workspace_id: uuid.UUID, user_id: uuid.UUID) -> list[str]:
+    """Delete a workspace. Returns the storage paths of its documents' files, which the
+    caller must now remove from storage: their database records are gone."""
     access = await get_access(session, workspace_id, user_id, lock=True)
     require_role(access, OWNER)
-    # Members go with it through the foreign key's ON DELETE CASCADE.
+    storage_paths = list(
+        await session.scalars(
+            select(Document.storage_path).where(Document.workspace_id == workspace_id)
+        )
+    )
+    # Members and documents go with it through each foreign key's ON DELETE CASCADE.
     await session.execute(delete(Workspace).where(Workspace.id == access.workspace.id))
     await session.commit()
+    return storage_paths
 
 
 async def list_members(

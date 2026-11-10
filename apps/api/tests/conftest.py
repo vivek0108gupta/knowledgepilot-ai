@@ -1,5 +1,6 @@
 import asyncio
 import os
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -28,9 +29,12 @@ from sqlalchemy import text  # noqa: E402
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine  # noqa: E402
 from sqlalchemy.pool import NullPool  # noqa: E402
 
+from app.api.v1.documents import get_storage_provider  # noqa: E402
 from app.core.db import get_session  # noqa: E402
 from app.main import app  # noqa: E402
+from app.services.processing import get_processing_queue, process_document  # noqa: E402
 from tests.auth import JWKS  # noqa: E402
+from tests.fakes import FakeStorage, RecordingQueue  # noqa: E402
 
 API_ROOT = Path(__file__).resolve().parent.parent
 
@@ -100,15 +104,48 @@ async def db_engine(database: None) -> AsyncIterator[AsyncEngine]:
 
 
 @pytest.fixture
-async def db_client(db_engine: AsyncEngine) -> AsyncIterator[AsyncClient]:
-    """An HTTP client whose requests run against the real test database."""
-    session_factory = async_sessionmaker(db_engine, expire_on_commit=False)
+def storage() -> FakeStorage:
+    """An in-memory stand-in for the private storage bucket."""
+    return FakeStorage()
+
+
+@pytest.fixture
+def queue() -> RecordingQueue:
+    """Records queued documents; tests run processing explicitly with `process`."""
+    return RecordingQueue()
+
+
+@pytest.fixture
+def session_factory(db_engine: AsyncEngine) -> async_sessionmaker:
+    return async_sessionmaker(db_engine, expire_on_commit=False)
+
+
+@pytest.fixture
+def process(session_factory: async_sessionmaker, storage: FakeStorage):  # noqa: ANN201
+    """Run the real processing pipeline for one document, against the test database."""
+
+    async def run(document_id: str | uuid.UUID) -> None:
+        await process_document(uuid.UUID(str(document_id)), session_factory, lambda: storage)
+
+    return run
+
+
+@pytest.fixture
+async def db_client(
+    session_factory: async_sessionmaker, storage: FakeStorage, queue: RecordingQueue
+) -> AsyncIterator[AsyncClient]:
+    """An HTTP client whose requests run against the real test database.
+
+    Storage and the processing queue are replaced by fakes; nothing leaves this process.
+    """
 
     async def real_session():  # noqa: ANN202
         async with session_factory() as session:
             yield session
 
     app.dependency_overrides[get_session] = real_session
+    app.dependency_overrides[get_storage_provider] = lambda: lambda: storage
+    app.dependency_overrides[get_processing_queue] = lambda: queue
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as http:
         yield http

@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,6 +27,17 @@ class Settings(BaseSettings):
     supabase_jwks_url: str = ""
     supabase_issuer: str = ""
     supabase_jwt_audience: str = "authenticated"
+
+    # Supabase Storage. The secret (or legacy service-role) key is server-only: it bypasses
+    # storage policies, so it must never reach the browser. SecretStr keeps it out of logs
+    # and error messages.
+    supabase_secret_key: SecretStr = SecretStr("")
+    supabase_storage_bucket: str = "knowledgepilot-documents"
+    # How long a download link works. Short on purpose: a leaked link soon stops working.
+    signed_url_ttl_seconds: int = 60
+
+    # How many documents may be extracted at the same time in this process.
+    processing_concurrency: int = 2
 
     @property
     def jwt_issuer(self) -> str:

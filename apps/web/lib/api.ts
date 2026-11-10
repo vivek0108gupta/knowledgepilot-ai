@@ -124,3 +124,95 @@ export type Readiness = z.infer<typeof readinessSchema>;
 export const getHealth = (signal?: AbortSignal) => apiFetch("/health", healthSchema, { signal });
 
 export const getReadiness = (signal?: AbortSignal) => apiFetch("/health/ready", readinessSchema, { signal });
+
+export interface UploadRequest {
+  /** Called with a number from 0 to 1 as the file is sent. */
+  onProgress?: (fraction: number) => void;
+  signal?: AbortSignal;
+}
+
+/**
+ * Sends a form (with files) to a `/api/v1` endpoint and returns the JSON body, checked against
+ * `schema`. Uses XMLHttpRequest because `fetch` cannot report upload progress.
+ * Rejects exactly like `apiFetch`: with an `ApiError`, or the abort reason if the caller aborts.
+ */
+export async function apiUpload<T>(
+  path: string,
+  schema: z.ZodType<T>,
+  form: FormData,
+  { onProgress, signal }: UploadRequest = {},
+): Promise<T> {
+  const token = apiAuth ? await apiAuth.getAccessToken() : null;
+
+  return new Promise<T>((resolve, reject) => {
+    const aborted = () => new DOMException("The upload was cancelled.", "AbortError");
+    if (signal?.aborted) {
+      reject(aborted());
+      return;
+    }
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${API_V1}${path}`);
+    xhr.setRequestHeader("Accept", "application/json");
+    if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+    // No Content-Type: the browser sets it, including the multipart boundary.
+
+    const abort = () => xhr.abort();
+    signal?.addEventListener("abort", abort);
+    const finish = () => signal?.removeEventListener("abort", abort);
+
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable && event.total > 0) onProgress?.(event.loaded / event.total);
+    };
+    xhr.onabort = () => {
+      finish();
+      reject(aborted());
+    };
+    xhr.onerror = () => {
+      finish();
+      reject(new ApiError(0, "network_error", "Could not reach the server."));
+    };
+    xhr.onload = () => {
+      finish();
+      const requestId = xhr.getResponseHeader("X-Request-ID") ?? undefined;
+      let body: unknown = null;
+      try {
+        body = JSON.parse(xhr.responseText);
+      } catch {
+        // Not JSON (for example an error page from a proxy); handled below as unexpected.
+      }
+
+      if (xhr.status < 200 || xhr.status >= 300) {
+        if (xhr.status === 401) apiAuth?.onUnauthorized();
+        const envelope = errorEnvelopeSchema.safeParse(body);
+        reject(
+          envelope.success
+            ? new ApiError(
+                xhr.status,
+                envelope.data.error.code,
+                envelope.data.error.message,
+                envelope.data.error.request_id ?? requestId,
+              )
+            : new ApiError(
+                xhr.status,
+                "unexpected_error",
+                `Request failed with status ${xhr.status}.`,
+                requestId,
+              ),
+        );
+        return;
+      }
+
+      const parsed = schema.safeParse(body);
+      if (!parsed.success) {
+        reject(
+          new ApiError(xhr.status, "invalid_response", "The server sent an unexpected response.", requestId),
+        );
+        return;
+      }
+      resolve(parsed.data);
+    };
+
+    xhr.send(form);
+  });
+}
