@@ -15,7 +15,7 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
 COPY alembic.ini ./
-COPY migrations ./migrations
+COPY alembic ./alembic
 COPY app ./app
 
 RUN useradd --create-home --uid 1000 api

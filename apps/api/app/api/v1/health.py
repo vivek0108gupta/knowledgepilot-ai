@@ -1,26 +1,16 @@
 import logging
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_session
 from app.core.errors import AppError
+from app.schemas.health import Health, Readiness
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["health"])
-
-
-class Health(BaseModel):
-    status: str
-
-
-class Readiness(BaseModel):
-    status: str
-    database: str
-    pgvector: str
 
 
 @router.get("/health")

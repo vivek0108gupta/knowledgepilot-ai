@@ -1,25 +1,18 @@
+import { z } from "zod";
+
 /** Base URL of the FastAPI backend. Inlined at build time, so it must be set before `next build`. */
 export const API_URL = (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000").replace(/\/$/, "");
 
 export const API_V1 = `${API_URL}/api/v1`;
 
 /** The shape every API error arrives in; see `app/core/errors.py` in the backend. */
-interface ErrorEnvelope {
-  error: { code: string; message: string; request_id?: string };
-}
-
-function isErrorEnvelope(value: unknown): value is ErrorEnvelope {
-  if (typeof value !== "object" || value === null || !("error" in value)) return false;
-  const { error } = value;
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    typeof error.code === "string" &&
-    "message" in error &&
-    typeof error.message === "string"
-  );
-}
+const errorEnvelopeSchema = z.object({
+  error: z.object({
+    code: z.string(),
+    message: z.string(),
+    request_id: z.string().optional(),
+  }),
+});
 
 /** A failed API call. `status` is 0 when the request never got a response. */
 export class ApiError extends Error {
@@ -38,10 +31,10 @@ export class ApiError extends Error {
 }
 
 /**
- * Calls a `/api/v1` endpoint and returns its JSON body.
+ * Calls a `/api/v1` endpoint and returns its JSON body, checked against `schema`.
  * Always rejects with an `ApiError`, except when the caller aborts the request.
  */
-export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+export async function apiFetch<T>(path: string, schema: z.ZodType<T>, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
     response = await fetch(`${API_V1}${path}`, {
@@ -54,27 +47,41 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
   }
 
   const body: unknown = await response.json().catch(() => null);
+  const requestId = response.headers.get("X-Request-ID") ?? undefined;
 
   if (!response.ok) {
-    const requestId = response.headers.get("X-Request-ID") ?? undefined;
-    if (isErrorEnvelope(body)) {
-      throw new ApiError(response.status, body.error.code, body.error.message, body.error.request_id ?? requestId);
+    const envelope = errorEnvelopeSchema.safeParse(body);
+    if (envelope.success) {
+      const { code, message, request_id } = envelope.data.error;
+      throw new ApiError(response.status, code, message, request_id ?? requestId);
     }
-    throw new ApiError(response.status, "unexpected_error", `Request failed with status ${response.status}.`, requestId);
+    throw new ApiError(
+      response.status,
+      "unexpected_error",
+      `Request failed with status ${response.status}.`,
+      requestId,
+    );
   }
 
-  return body as T;
+  const parsed = schema.safeParse(body);
+  if (!parsed.success) {
+    // The backend and this client disagree about the response shape: fail loudly, not downstream.
+    throw new ApiError(
+      response.status,
+      "invalid_response",
+      "The server sent an unexpected response.",
+      requestId,
+    );
+  }
+  return parsed.data;
 }
 
-export interface Health {
-  status: string;
-}
+export const healthSchema = z.object({ status: z.string() });
+export type Health = z.infer<typeof healthSchema>;
 
-export interface Readiness extends Health {
-  database: string;
-  pgvector: string;
-}
+export const readinessSchema = healthSchema.extend({ database: z.string(), pgvector: z.string() });
+export type Readiness = z.infer<typeof readinessSchema>;
 
-export const getHealth = (init?: RequestInit) => apiFetch<Health>("/health", init);
+export const getHealth = (init?: RequestInit) => apiFetch("/health", healthSchema, init);
 
-export const getReadiness = (init?: RequestInit) => apiFetch<Readiness>("/health/ready", init);
+export const getReadiness = (init?: RequestInit) => apiFetch("/health/ready", readinessSchema, init);

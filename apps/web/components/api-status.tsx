@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 
 import { getReadiness } from "@/lib/api";
 
@@ -20,19 +20,12 @@ const DOT: Record<Status, string> = {
 
 /** Shows whether the browser can reach the backend and the backend can reach its database. */
 export function ApiStatus() {
-  const [status, setStatus] = useState<Status>("checking");
+  const { isPending, isError } = useQuery({
+    queryKey: ["health", "ready"],
+    queryFn: ({ signal }) => getReadiness({ signal }),
+  });
 
-  useEffect(() => {
-    const controller = new AbortController();
-
-    getReadiness({ signal: controller.signal })
-      .then(() => setStatus("online"))
-      .catch(() => {
-        if (!controller.signal.aborted) setStatus("offline");
-      });
-
-    return () => controller.abort();
-  }, []);
+  const status: Status = isPending ? "checking" : isError ? "offline" : "online";
 
   return (
     <p

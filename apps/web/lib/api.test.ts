@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 
-import { ApiError, apiFetch, getHealth } from "./api.ts";
+import { ApiError, apiFetch, getHealth, healthSchema, readinessSchema } from "./api.ts";
 
 const realFetch = globalThis.fetch;
 
@@ -34,7 +34,7 @@ test("turns the API's error envelope into an ApiError", async () => {
     ),
   );
 
-  await assert.rejects(apiFetch("/health/ready"), (error) => {
+  await assert.rejects(apiFetch("/health/ready", readinessSchema), (error) => {
     assert.ok(error instanceof ApiError);
     assert.equal(error.status, 503);
     assert.equal(error.code, "database_unavailable");
@@ -45,9 +45,11 @@ test("turns the API's error envelope into an ApiError", async () => {
 });
 
 test("handles an error response that is not JSON", async () => {
-  stubFetch(() => new Response("<html>Bad Gateway</html>", { status: 502, headers: { "X-Request-ID": "proxy-1" } }));
+  stubFetch(
+    () => new Response("<html>Bad Gateway</html>", { status: 502, headers: { "X-Request-ID": "proxy-1" } }),
+  );
 
-  await assert.rejects(apiFetch("/health"), (error) => {
+  await assert.rejects(apiFetch("/health", healthSchema), (error) => {
     assert.ok(error instanceof ApiError);
     assert.equal(error.status, 502);
     assert.equal(error.code, "unexpected_error");
@@ -61,7 +63,7 @@ test("reports a network failure as status 0", async () => {
     throw new TypeError("fetch failed");
   });
 
-  await assert.rejects(apiFetch("/health"), (error) => {
+  await assert.rejects(apiFetch("/health", healthSchema), (error) => {
     assert.ok(error instanceof ApiError);
     assert.equal(error.status, 0);
     assert.equal(error.code, "network_error");
@@ -77,5 +79,19 @@ test("lets an abort through unchanged, so callers can ignore it", async () => {
     throw abort;
   });
 
-  await assert.rejects(apiFetch("/health", { signal: controller.signal }), (error) => error === abort);
+  await assert.rejects(
+    apiFetch("/health", healthSchema, { signal: controller.signal }),
+    (error) => error === abort,
+  );
+});
+
+test("rejects a success response that does not match the schema", async () => {
+  stubFetch(() => Response.json({ status: "ok" }));
+
+  await assert.rejects(apiFetch("/health/ready", readinessSchema), (error) => {
+    assert.ok(error instanceof ApiError);
+    assert.equal(error.status, 200);
+    assert.equal(error.code, "invalid_response");
+    return true;
+  });
 });

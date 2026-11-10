@@ -14,14 +14,16 @@ This is the Phase 1 foundation: the web app, the API, and a local Postgres with 
 ```
 apps/
   web/                 Next.js App Router, TypeScript (strict), Tailwind CSS
-    src/app/           routes and layouts
-    src/components/    React components
-    src/lib/api.ts     typed client for the API; all backend calls go through it
+    app/               routes and layouts
+    components/        React components, including the TanStack Query provider
+    lib/api.ts         typed client for the API; responses are validated with Zod
   api/                 FastAPI, SQLAlchemy (async), Alembic, Pytest
     app/api/v1/        HTTP routes, one module per resource
     app/core/          config, database, logging, errors, request middleware
     app/models/        SQLAlchemy models
-    migrations/        Alembic migrations
+    app/schemas/       Pydantic request and response models
+    app/services/      business logic called by the routes
+    alembic/           database migrations
     tests/
 docker-compose.yml     database, API, and web app together
 .env.example           every environment variable, with placeholder values
@@ -94,14 +96,16 @@ Every API error has the same shape, and every response carries an `X-Request-ID`
 { "error": { "code": "database_unavailable", "message": "Database is unreachable.", "request_id": "…" } }
 ```
 
-Each log line includes that request ID, so an error a user reports can be matched to its log entry. Unhandled errors return a generic 500; the cause is logged, never sent to the client. Set `LOG_LEVEL` to change verbosity. In the web app, `apiFetch` in `src/lib/api.ts` turns these responses into a typed `ApiError`.
+Each log line includes that request ID, so an error a user reports can be matched to its log entry. Unhandled errors return a generic 500; the cause is logged, never sent to the client. Set `LOG_LEVEL` to change verbosity. In the web app, `apiFetch` in `lib/api.ts` turns these responses into a typed `ApiError`, and rejects a success response that does not match its Zod schema.
 
 ## Checks
+
+Ruff lints and formats the API; ESLint lints and Prettier formats the web app (`npm run format` to apply).
 
 ```sh
 cd apps/api && uv run pytest && uv run ruff check . && uv run ruff format --check .
 ```
 
 ```sh
-cd apps/web && npm run typecheck && npm run lint && npm test && npm run build
+cd apps/web && npm run typecheck && npm run lint && npm run format:check && npm test && npm run build
 ```
