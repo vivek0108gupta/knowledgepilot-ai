@@ -52,8 +52,11 @@ class TestCreateMessage:
             "content",
             "sequence_number",
             "metadata",
+            "model",
+            "citations",
             "created_at",
         }
+        assert (body["model"], body["citations"]) == (None, [])
 
     async def test_content_is_stored_exactly_as_written(
         self, db_client: AsyncClient, chat: dict

@@ -1,7 +1,13 @@
 "use client";
 
 import { Menu } from "@base-ui/react/menu";
-import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type InfiniteData,
+} from "@tanstack/react-query";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useId, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
@@ -13,6 +19,8 @@ import { Modal } from "@/components/ui/modal";
 import { ApiError, errorMessage } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import {
+  askQuestion,
+  chatErrorMessage,
   chatPath,
   conversationKeys,
   conversationTitleSchema,
@@ -23,12 +31,16 @@ import {
   listMessages,
   MAX_MESSAGE_LENGTH,
   MAX_TITLE_LENGTH,
+  questionWasKept,
   renameConversation,
-  sendMessage,
   validateMessage,
+  type Citation,
   type Conversation,
   type Message,
+  type MessagePage,
 } from "@/lib/conversations";
+import { getDownload, startDownload } from "@/lib/documents";
+import { sourceLabel } from "@/lib/search";
 import { getWorkspace, workspaceKeys } from "@/lib/workspaces";
 
 const timeFormat = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
@@ -287,22 +299,195 @@ function ConversationSidebar({ workspaceId, activeId, hiddenOnMobile }: SidebarP
   );
 }
 
-function MessageBubble({ message }: { message: Message }) {
-  const mine = message.role === "user";
+/** Splits an answer into text and its [1] / [1, 2] markers, so each marker can be a button. */
+function splitMarkers(content: string): Array<string | number[]> {
+  const parts: Array<string | number[]> = [];
+  let last = 0;
+  for (const match of content.matchAll(/\[(\d+(?:\s*,\s*\d+)*)\]/g)) {
+    if (match.index > last) parts.push(content.slice(last, match.index));
+    parts.push(match[1]!.split(",").map((value) => Number(value.trim())));
+    last = match.index + match[0].length;
+  }
+  if (last < content.length) parts.push(content.slice(last));
+  return parts;
+}
+
+function SourceCard({
+  citation,
+  cardId,
+  open,
+  onToggle,
+}: {
+  citation: Citation;
+  cardId: string;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  const excerptId = `${cardId}-excerpt`;
+  const download = useMutation({
+    mutationFn: () => getDownload(citation.document_id),
+    onSuccess: (link) => startDownload(link.url),
+  });
+  const location = sourceLabel(citation);
+
   return (
-    <li className={cn("flex flex-col gap-1", mine ? "items-end" : "items-start")}>
-      <span className="sr-only">{mine ? "You said:" : "Assistant said:"}</span>
+    <li id={cardId} className="rounded-lg border border-zinc-200 bg-white p-3 text-sm">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div className="flex min-w-0 items-start gap-2">
+          <span
+            aria-hidden="true"
+            className="grid size-5 shrink-0 place-items-center rounded bg-zinc-900 text-[11px] font-semibold text-white"
+          >
+            {citation.number}
+          </span>
+          <div className="min-w-0">
+            <p className="font-medium break-words text-zinc-900">
+              <span className="sr-only">Source {citation.number}: </span>
+              {citation.document_name}
+            </p>
+            {location && <p className="text-xs text-zinc-500">{location}</p>}
+          </div>
+        </div>
+        <div className="flex gap-1">
+          <Button variant="ghost" size="sm" aria-expanded={open} aria-controls={excerptId} onClick={onToggle}>
+            {open ? "Hide excerpt" : "Show excerpt"}
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            loading={download.isPending}
+            aria-label={`Download ${citation.document_name}`}
+            onClick={() => download.mutate()}
+          >
+            {download.isPending ? "Preparing…" : "Download"}
+          </Button>
+        </div>
+      </div>
+      {/* Document text is shown as plain text, never rendered as HTML. */}
+      <blockquote
+        id={excerptId}
+        hidden={!open}
+        className="mt-2 border-l-2 border-zinc-300 pl-3 text-zinc-700 whitespace-pre-line"
+      >
+        {citation.excerpt}
+      </blockquote>
+      {download.isError && (
+        <div className="mt-2">
+          <Alert>{errorMessage(download.error)}</Alert>
+        </div>
+      )}
+    </li>
+  );
+}
+
+function UserBubble({
+  content,
+  createdAt,
+  sending,
+}: {
+  content: string;
+  createdAt?: string;
+  sending?: boolean;
+}) {
+  return (
+    <li className="flex flex-col items-end gap-1">
+      <span className="sr-only">You said:</span>
       {/* Message text is shown as plain text. It is never rendered as HTML. */}
       <p
         className={cn(
-          "max-w-[85%] rounded-2xl px-4 py-2 text-sm leading-6 break-words whitespace-pre-wrap",
-          mine
-            ? "rounded-br-md bg-zinc-900 text-white"
-            : "rounded-bl-md border border-zinc-200 bg-white text-zinc-900",
+          "max-w-[85%] rounded-2xl rounded-br-md bg-zinc-900 px-4 py-2 text-sm leading-6 break-words whitespace-pre-wrap text-white",
+          sending && "opacity-70",
         )}
       >
-        {message.content}
+        {content}
       </p>
+      {createdAt ? (
+        <time dateTime={createdAt} className="px-1 text-xs text-zinc-500">
+          {timeFormat.format(new Date(createdAt))}
+        </time>
+      ) : (
+        <span className="px-1 text-xs text-zinc-500">Sending…</span>
+      )}
+    </li>
+  );
+}
+
+function AssistantBubble({ message }: { message: Message }) {
+  const baseId = useId();
+  const [open, setOpen] = useState<number | null>(null);
+  const grounded = message.metadata?.grounded !== false;
+  const citations = message.citations ?? [];
+
+  function reveal(number: number) {
+    setOpen(number);
+    document.getElementById(`${baseId}-source-${number}`)?.scrollIntoView?.({ block: "nearest" });
+  }
+
+  return (
+    <li className="flex flex-col items-start gap-1">
+      <span className="sr-only">Assistant said:</span>
+      <div
+        className={cn(
+          "max-w-[85%] rounded-2xl rounded-bl-md border px-4 py-2 text-sm leading-6",
+          grounded ? "border-zinc-200 bg-white text-zinc-900" : "border-amber-200 bg-amber-50 text-amber-900",
+        )}
+      >
+        <p className="break-words whitespace-pre-wrap">
+          {splitMarkers(message.content).map((part, index) =>
+            typeof part === "string" ? (
+              part
+            ) : (
+              <span key={index} className="whitespace-nowrap">
+                [
+                {part.map((number, position) => {
+                  const known = citations.some((citation) => citation.number === number);
+                  return (
+                    <span key={number}>
+                      {position > 0 && ", "}
+                      {known ? (
+                        <button
+                          type="button"
+                          onClick={() => reveal(number)}
+                          aria-label={`Show source ${number}`}
+                          className="rounded px-0.5 font-medium text-zinc-900 underline decoration-zinc-400 underline-offset-2 hover:bg-zinc-100 focus-visible:outline-2 focus-visible:outline-zinc-900"
+                        >
+                          {number}
+                        </button>
+                      ) : (
+                        number
+                      )}
+                    </span>
+                  );
+                })}
+                ]
+              </span>
+            ),
+          )}
+        </p>
+        {!grounded && (
+          <p className="mt-1 text-xs text-amber-800">
+            No supporting passage was found in this workspace&apos;s documents.
+          </p>
+        )}
+      </div>
+
+      {citations.length > 0 && (
+        <section aria-label="Sources" className="w-full max-w-[85%]">
+          <h3 className="mt-1 mb-1.5 text-xs font-medium tracking-wide text-zinc-500 uppercase">Sources</h3>
+          <ol className="flex flex-col gap-2">
+            {citations.map((citation) => (
+              <SourceCard
+                key={citation.number}
+                citation={citation}
+                cardId={`${baseId}-source-${citation.number}`}
+                open={open === citation.number}
+                onToggle={() => setOpen(open === citation.number ? null : citation.number)}
+              />
+            ))}
+          </ol>
+        </section>
+      )}
+
       <time dateTime={message.created_at} className="px-1 text-xs text-zinc-500">
         {timeFormat.format(new Date(message.created_at))}
       </time>
@@ -310,43 +495,40 @@ function MessageBubble({ message }: { message: Message }) {
   );
 }
 
-function Composer({ workspaceId, conversation }: { workspaceId: string; conversation: Conversation }) {
-  const queryClient = useQueryClient();
-  const inputId = useId();
-  const [draft, setDraft] = useState("");
-  const [draftError, setDraftError] = useState<string | null>(null);
-  // One ID per message, kept across retries of the same text, so that a message whose
-  // response was lost is not stored twice when it is sent again.
-  const pending = useRef<{ content: string; id: string } | null>(null);
+function MessageBubble({ message }: { message: Message }) {
+  return message.role === "user" ? (
+    <UserBubble content={message.content} createdAt={message.created_at} />
+  ) : (
+    <AssistantBubble message={message} />
+  );
+}
 
-  const send = useMutation({
-    mutationFn: (content: string) => {
-      if (pending.current?.content !== content) {
-        pending.current = { content, id: crypto.randomUUID() };
-      }
-      return sendMessage(conversation.id, content, pending.current.id);
-    },
-    onSuccess: async () => {
-      pending.current = null;
-      setDraft("");
-      // Show what the server stored, and pick up the new title and ordering.
-      await Promise.all([
-        queryClient.invalidateQueries({ queryKey: conversationKeys.messages(workspaceId, conversation.id) }),
-        queryClient.invalidateQueries({ queryKey: conversationKeys.list(workspaceId), exact: true }),
-        queryClient.invalidateQueries({
-          queryKey: conversationKeys.detail(workspaceId, conversation.id),
-          exact: true,
-        }),
-      ]);
-    },
-  });
+interface Failure {
+  message: string;
+  content: string;
+  id: string;
+  kept: boolean;
+}
+
+interface ComposerProps {
+  conversation: Conversation;
+  draft: string;
+  onDraftChange: (draft: string) => void;
+  sending: boolean;
+  failure: Failure | null;
+  onSend: () => void;
+  onRetry: () => void;
+}
+
+function Composer({ conversation, draft, onDraftChange, sending, failure, onSend, onRetry }: ComposerProps) {
+  const inputId = useId();
+  const [draftError, setDraftError] = useState<string | null>(null);
 
   function submit() {
-    if (send.isPending) return;
+    if (sending) return;
     const problem = validateMessage(draft);
     setDraftError(problem);
-    if (problem) return;
-    send.mutate(draft);
+    if (!problem) onSend();
   }
 
   function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -368,9 +550,16 @@ function Composer({ workspaceId, conversation }: { workspaceId: string; conversa
       }}
       className="border-t border-zinc-200 p-3"
     >
-      {send.isError && (
+      {failure && (
         <div className="mb-2">
-          <Alert>{errorMessage(send.error)} Your message is still in the box; you can send it again.</Alert>
+          <Alert>
+            <span>{failure.message}</span>
+            {failure.kept && (
+              <Button variant="secondary" size="sm" className="ml-2" onClick={onRetry} disabled={sending}>
+                Try again
+              </Button>
+            )}
+          </Alert>
         </div>
       )}
       {draftError && (
@@ -386,31 +575,35 @@ function Composer({ workspaceId, conversation }: { workspaceId: string; conversa
           id={inputId}
           value={draft}
           onChange={(event) => {
-            setDraft(event.target.value);
+            onDraftChange(event.target.value);
             if (draftError) setDraftError(null);
           }}
           onKeyDown={handleKeyDown}
           rows={2}
           maxLength={MAX_MESSAGE_LENGTH}
-          placeholder={archived ? "This conversation is archived." : "Write a message…"}
-          disabled={send.isPending || archived}
+          placeholder={archived ? "This conversation is archived." : "Ask a question about your documents…"}
+          disabled={sending || archived}
           aria-invalid={draftError ? true : undefined}
           aria-describedby={`${inputId}-hint${draftError ? ` ${inputId}-error` : ""}`}
           className="max-h-48 min-h-[2.75rem] flex-1 resize-y rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-400 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-zinc-900 disabled:cursor-not-allowed disabled:bg-zinc-50"
         />
-        <Button type="submit" loading={send.isPending} disabled={archived}>
-          {send.isPending ? "Sending…" : "Send"}
+        <Button type="submit" loading={sending} disabled={archived}>
+          {sending ? "Answering…" : "Send"}
         </Button>
       </div>
       <p id={`${inputId}-hint`} className="mt-2 text-xs text-zinc-500">
-        Enter to send, Shift+Enter for a new line. Messages are saved; AI answers are not available yet.
+        Enter to send, Shift+Enter for a new line. Answers come only from this workspace&apos;s documents.
       </p>
     </form>
   );
 }
 
 function ChatArea({ workspaceId, conversationId }: { workspaceId: string; conversationId: string }) {
+  const queryClient = useQueryClient();
   const endRef = useRef<HTMLDivElement | null>(null);
+  const [draft, setDraft] = useState("");
+  const [pending, setPending] = useState<{ content: string; id: string } | null>(null);
+  const [failure, setFailure] = useState<Failure | null>(null);
 
   const conversation = useQuery({
     queryKey: conversationKeys.detail(workspaceId, conversationId),
@@ -420,9 +613,10 @@ function ChatArea({ workspaceId, conversationId }: { workspaceId: string; conver
   // The URL names both a workspace and a conversation. If they do not belong together,
   // show nothing rather than a conversation under the wrong workspace.
   const belongs = conversation.data?.workspace_id === workspaceId;
+  const messagesKey = conversationKeys.messages(workspaceId, conversationId);
 
   const messages = useInfiniteQuery({
-    queryKey: conversationKeys.messages(workspaceId, conversationId),
+    queryKey: messagesKey,
     queryFn: ({ pageParam, signal }) => listMessages(conversationId, pageParam, signal),
     initialPageParam: undefined as number | undefined,
     // "Next" here means further back in time: the page before the oldest one loaded.
@@ -430,12 +624,72 @@ function ChatArea({ workspaceId, conversationId }: { workspaceId: string; conver
     enabled: belongs,
   });
 
+  // The list and the heading may have changed (a new title, a new order). The messages
+  // themselves come back in the answer, so they are refetched only after a failure.
+  const refreshConversation = () =>
+    Promise.all([
+      queryClient.invalidateQueries({ queryKey: conversationKeys.list(workspaceId), exact: true }),
+      queryClient.invalidateQueries({
+        queryKey: conversationKeys.detail(workspaceId, conversationId),
+        exact: true,
+      }),
+    ]);
+
+  const ask = useMutation({
+    mutationFn: (question: { content: string; id: string }) =>
+      askQuestion(conversationId, question.content, question.id),
+    onMutate: (question) => {
+      setFailure(null);
+      setPending(question);
+    },
+    onSuccess: (result) => {
+      // Show the stored question and answer at once, then refresh in the background.
+      queryClient.setQueryData<InfiniteData<MessagePage, number | undefined>>(messagesKey, (data) => {
+        if (!data || data.pages.length === 0) return data;
+        const [newest, ...older] = data.pages;
+        const known = new Set(data.pages.flatMap((page) => page.items.map((item) => item.id)));
+        const added = [result.user_message, result.assistant_message].filter((item) => !known.has(item.id));
+        return {
+          ...data,
+          pages: [
+            { ...newest!, items: [...newest!.items, ...added], total: newest!.total + added.length },
+            ...older,
+          ],
+        };
+      });
+      setPending(null);
+      void refreshConversation();
+    },
+    onError: (error, question) => {
+      const kept = questionWasKept(error);
+      setFailure({ message: chatErrorMessage(error), ...question, kept });
+      setPending(null);
+      // A question that was not stored goes back into the box so nothing is lost.
+      if (!kept) setDraft((current) => current || question.content);
+      // Show the stored question, if it was stored.
+      void queryClient.invalidateQueries({ queryKey: messagesKey });
+      void refreshConversation();
+    },
+  });
+
+  function send() {
+    const content = draft;
+    // Resending the text of a failed question reuses its ID, so it is not stored twice.
+    const id = failure && failure.content === content ? failure.id : crypto.randomUUID();
+    setDraft("");
+    ask.mutate({ content, id });
+  }
+
+  function retry() {
+    if (failure) ask.mutate({ content: failure.content, id: failure.id });
+  }
+
   const ordered = messages.data ? [...messages.data.pages].reverse().flatMap((page) => page.items) : [];
   const newest = ordered.at(-1)?.id;
 
   useEffect(() => {
     endRef.current?.scrollIntoView?.({ block: "end" });
-  }, [newest]);
+  }, [newest, pending]);
 
   const backLink = (
     <Link href={chatPath(workspaceId)} className={cn(buttonClass("ghost", "sm"), "md:hidden")}>
@@ -504,10 +758,10 @@ function ChatArea({ workspaceId, conversationId }: { workspaceId: string; conver
             description={errorMessage(messages.error)}
             onRetry={() => void messages.refetch()}
           />
-        ) : ordered.length === 0 ? (
+        ) : ordered.length === 0 && !pending ? (
           <EmptyState
             title="No messages yet"
-            description="Write your first message below. It is saved to this conversation, which only you can see. AI answers are not available yet; they arrive in the next milestone."
+            description="Ask a question about this workspace's documents. Answers come only from those documents and show the passages they rely on. Only you can see this conversation."
           />
         ) : (
           <>
@@ -527,13 +781,28 @@ function ChatArea({ workspaceId, conversationId }: { workspaceId: string; conver
               {ordered.map((message) => (
                 <MessageBubble key={message.id} message={message} />
               ))}
+              {pending && <UserBubble content={pending.content} sending />}
             </ol>
+            {pending && (
+              <div role="status" className="mt-3 flex items-center gap-2 text-sm text-zinc-500">
+                <span aria-hidden="true" className="size-2 animate-pulse rounded-full bg-zinc-400" />
+                Searching your documents and writing an answer…
+              </div>
+            )}
           </>
         )}
         <div ref={endRef} />
       </div>
 
-      <Composer workspaceId={workspaceId} conversation={conversation.data} />
+      <Composer
+        conversation={conversation.data}
+        draft={draft}
+        onDraftChange={setDraft}
+        sending={ask.isPending}
+        failure={failure}
+        onSend={send}
+        onRetry={retry}
+      />
     </section>
   );
 }

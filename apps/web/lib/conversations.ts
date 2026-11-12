@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { apiFetch } from "./api";
+import { ApiError, apiFetch } from "./api";
 
 export const DEFAULT_CONVERSATION_TITLE = "New conversation";
 export const MAX_TITLE_LENGTH = 120;
@@ -26,6 +26,20 @@ const conversationPageSchema = z.object({
 });
 export type ConversationPage = z.infer<typeof conversationPageSchema>;
 
+/** A source an answer relies on. The server builds these from the passages it retrieved. */
+export const citationSchema = z.object({
+  number: z.number(),
+  document_id: z.uuid(),
+  document_name: z.string(),
+  chunk_id: z.uuid(),
+  page_number: z.number().nullable(),
+  paragraph_index: z.number().nullable(),
+  line_start: z.number().nullable(),
+  line_end: z.number().nullable(),
+  excerpt: z.string(),
+});
+export type Citation = z.infer<typeof citationSchema>;
+
 export const messageSchema = z.object({
   id: z.uuid(),
   conversation_id: z.uuid(),
@@ -34,9 +48,18 @@ export const messageSchema = z.object({
   content: z.string(),
   sequence_number: z.number(),
   metadata: z.record(z.string(), z.unknown()).nullable().optional(),
+  model: z.string().nullable().optional(),
+  citations: z.array(citationSchema).optional().default([]),
   created_at: z.string(),
 });
 export type Message = z.infer<typeof messageSchema>;
+
+const chatResponseSchema = z.object({
+  conversation_id: z.uuid(),
+  user_message: messageSchema,
+  assistant_message: messageSchema,
+});
+export type ChatResponse = z.infer<typeof chatResponseSchema>;
 
 const messagePageSchema = z.object({
   items: z.array(messageSchema),
@@ -86,6 +109,52 @@ export const sendMessage = (conversationId: string, content: string, clientMessa
     method: "POST",
     body: { content, client_message_id: clientMessageId },
   });
+
+/**
+ * Asks a question in a conversation and returns the stored question and its answer.
+ * The workspace is the conversation's own; nothing here can point the search elsewhere.
+ * Reusing `clientMessageId` after a failure retries the answer without storing the question
+ * twice; once answered, the same ID returns the stored answer.
+ */
+export const askQuestion = (conversationId: string, message: string, clientMessageId: string) =>
+  apiFetch(`/conversations/${conversationId}/chat`, chatResponseSchema, {
+    method: "POST",
+    body: { message, client_message_id: clientMessageId },
+  });
+
+/** Failures after which the question is already stored, so retrying is the right move. */
+const SAVED_QUESTION_CODES = new Set([
+  "ai_unavailable",
+  "ai_misconfigured",
+  "ai_rejected",
+  "ai_invalid_response",
+  "embeddings_unavailable",
+  "answer_not_saved",
+  "answer_in_progress",
+]);
+
+/** Whether a failed question was stored and can be retried with the same ID. A lost
+ * connection counts: the question may have been stored, and a retry is idempotent. */
+export function questionWasKept(error: unknown): boolean {
+  return error instanceof ApiError && (error.status === 0 || SAVED_QUESTION_CODES.has(error.code));
+}
+
+/** A message for a failed question that says what the person can do. */
+export function chatErrorMessage(error: unknown): string {
+  if (!(error instanceof ApiError)) return "Something went wrong. Please try again.";
+  if (error.status === 0) return "Could not reach the server. Check your connection, then try again.";
+  if (error.status === 401) return "Your session has expired. Sign in again to continue.";
+  if (error.status === 404) return "This conversation no longer exists, or it is not one of yours.";
+  if (error.code === "conversation_busy") return "An answer is still being written. Wait for it to finish.";
+  if (error.code === "answer_in_progress")
+    return "The answer to this question is still being written. Try again in a moment.";
+  if (error.code === "ai_not_configured") return "Answering questions has not been set up on the server yet.";
+  if (error.status === 422) return "That question could not be sent. Shorten or change it and try again.";
+  if (error.status === 429) return "Too many requests. Wait a moment and try again.";
+  // These messages are written by the API for people, and say the question was kept.
+  if (SAVED_QUESTION_CODES.has(error.code) || error.code === "conversation_archived") return error.message;
+  return "Something went wrong. Please try again.";
+}
 
 export const conversationTitleSchema = z
   .string()

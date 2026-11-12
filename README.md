@@ -2,7 +2,7 @@
 
 Upload documents, ask questions, and get answers grounded in those documents with citations back to the source page.
 
-Built so far: sign-up and sign-in with Supabase Auth, workspaces with owner, admin and member roles, document upload with text extraction, semantic search over documents, and private conversations that store the user's messages. AI answers are not implemented yet: they come in the next phase.
+Built so far: sign-up and sign-in with Supabase Auth, workspaces with owner, admin and member roles, document upload with text extraction, semantic search over documents, and private conversations in which questions are answered from the workspace's documents, with citations.
 
 ## Requirements
 
@@ -28,7 +28,8 @@ apps/
     app/models/        SQLAlchemy models
     app/schemas/       Pydantic request and response models
     app/services/      business rules and authorization; storage, file validation, text
-                       extraction, chunking, embeddings, search, and the processing pipeline
+                       extraction, chunking, embeddings, search, the processing pipeline,
+                       and question answering (chat, llm, prompts, context, citations)
     alembic/           database migrations
     tests/
 docker-compose.yml     database, API, and web app together
@@ -268,7 +269,7 @@ The API image downloads the tokenizer's vocabulary while it is built, so the run
 
 ## Conversations
 
-Each workspace has a chat area where a user keeps conversations and the messages they write in them. This phase is the foundation only: **messages are stored and shown, but nothing answers them yet.** No language model is called anywhere in this feature, and it works with no OpenAI key. Answer generation will be added in the next phase (Phase 5.2), using the model named by `OPENAI_CHAT_MODEL`.
+Each workspace has a chat area where a user keeps conversations. A question asked there is answered from the workspace's documents, with citations to the passages used; see [Answering questions](#answering-questions). Plain messages can also be stored without an answer (`POST …/messages`).
 
 ### Privacy model
 
@@ -314,7 +315,7 @@ The unique constraint on `(conversation_id, sequence_number)` also serves every 
 
 ### Message persistence
 
-- **Only user messages can be created through the API.** The request has no `role` field, and a request that includes one (or a `sequence_number`, `model` or `metadata`) is rejected. Assistant messages will be written by trusted backend code in the next phase; the database accepts them but the public endpoint does not. Prompts given to a model are never stored as messages, so they cannot be read back.
+- **Only user messages can be created through the API.** No request has a `role` field, and a request that includes one (or a `sequence_number`, `model` or `metadata`) is rejected. Assistant messages are written only by the answering service. Prompts given to the model are never stored as messages, so they cannot be read back.
 - **Ordering is by `sequence_number`, never by timestamp.** The number is assigned by the server while it holds a row lock on the conversation, so messages sent at the same moment get distinct, consecutive numbers.
 - **Duplicates are prevented.** The client sends a `client_message_id` with each message and reuses it when retrying. Sending the same ID again returns the message already stored, with `200` instead of `201`. Reusing an ID for different text is a `409`.
 - **Limits.** 1 to 8,000 characters; empty and whitespace-only messages are rejected.
@@ -345,13 +346,143 @@ Open a workspace and choose **Open chat**, or go to `/dashboard/workspaces/{work
 
 ### Limitations of conversations
 
-- **No AI answers yet.** The app says so in the chat area. Nothing calls OpenAI from this feature.
 - **Private only.** There is no sharing, and a workspace owner cannot see members' conversations.
 - **Leaving a workspace hides your conversations there.** They are kept in the database and reappear if you rejoin; they are deleted only with the workspace or by you.
 - **Archive has no screen yet.** The endpoints exist; the web app offers rename and delete.
 - **The list shows the 100 most recent conversations.** The API paginates; the sidebar does not page yet.
 - **Messages cannot be edited or deleted individually.**
 - **No rate limit on sending messages yet.**
+
+## Answering questions
+
+`POST /api/v1/conversations/{conversation_id}/chat` stores a question, answers it from the documents of the conversation's workspace, and stores the answer.
+
+### How an answer is made
+
+```
+question -> check the caller owns the conversation -> take the conversation's lease
+         -> recent history -> embed -> nearest passages (this workspace, ready documents)
+         -> bounded context -> model (Responses API, strict JSON) -> check citations
+         -> store the answer -> release the lease
+```
+
+| Step | Module | Responsibility |
+|---|---|---|
+| Orchestration | `app/services/chat.py` | Order of steps, transactions, the lease, error mapping. Nothing else. |
+| History | `app/services/chat_history.py` | Which earlier turns the model sees. |
+| Query embedding | `app/services/embeddings.py` | The existing embedding service, unchanged. |
+| Retrieval | `app/services/search.py` (`nearest`) | The existing pgvector query, shared with search. |
+| Context | `app/services/context_builder.py` | Choosing and wrapping passages within a token budget. |
+| Instructions | `app/services/prompts.py` | The system prompt, versioned (`PROMPT_VERSION`), and the output schema. |
+| Model | `app/services/llm.py` | The only code that knows OpenAI's API. Replaceable for tests. |
+| Citations | `app/services/citations.py` | Checking the answer against the evidence and building citations. |
+| Shared client | `app/services/openai_client.py` | One OpenAI client configuration for embeddings and answers. |
+
+The workspace always comes from the conversation the caller was authorised for; the request cannot name one. Retrieval runs the same SQL as search, which filters on that workspace and joins the caller's own membership, and uses only `ready` documents.
+
+### Request and response
+
+```json
+{ "message": "What is the refund policy?", "client_message_id": "uuid", "document_ids": [], "top_k": 5 }
+```
+
+Only `message` is required (1 to 8,000 characters). `document_ids` (up to 50) restricts the evidence to those documents; `top_k` defaults to 5 and may be at most `CHAT_MAX_TOP_K` (10).
+
+```json
+{
+  "conversation_id": "uuid",
+  "user_message": { "id": "uuid", "role": "user", "content": "What is the refund policy?", "sequence_number": 1, "...": "..." },
+  "assistant_message": {
+    "id": "uuid",
+    "role": "assistant",
+    "content": "Customers can request a refund within 30 days [1].",
+    "model": "gpt-4.1-mini-2025-04-14",
+    "metadata": { "grounded": true },
+    "citations": [
+      {
+        "number": 1,
+        "document_id": "uuid",
+        "document_name": "Refund_Policy.pdf",
+        "chunk_id": "uuid",
+        "page_number": 4,
+        "paragraph_index": null,
+        "line_start": null,
+        "line_end": null,
+        "excerpt": "Customers can request a refund within 30 days"
+      }
+    ]
+  }
+}
+```
+
+`201` for a new answer. Message history (`GET …/messages`) returns answers with the same `model` and `citations`, so they survive a refresh.
+
+### Retrieval and context
+
+- **Retrieval.** The question is embedded with the existing model (`text-embedding-3-small`) and the nearest passages are found by cosine similarity, `CHAT_TOP_K` of them (default 5). A passage less similar than `CHAT_MIN_SIMILARITY` (default **0.2**) is not used. That threshold is an estimate: on one real document, relevant questions scored 0.30 to 0.54 and an unrelated one 0.10, so 0.2 separates them, but it has not been tuned on a broader set. Every stored answer records the similarity scores (never the text) so it can be tuned.
+- **Follow-ups.** For a follow-up such as "explain the second point", the question is searched twice in one embedding request: alone, and together with the end of the previous exchange. The best passages of either are used. Fresh evidence is retrieved for every question.
+- **Context.** Passages are added most similar first until `CHAT_CONTEXT_TOKENS` (6,000) is used. A passage that does not fit is skipped, never cut, and its document name and location are always kept whole. No document may take more than `CHAT_MAX_CHUNKS_PER_DOCUMENT` (3) places while passages from other documents are waiting; any budget left is then filled from the passages held back, so a workspace with a single document still gets all its relevant passages.
+- **No evidence, no model call.** If no passage reaches the threshold (an empty workspace, nothing relevant, only failed or unprocessed documents), the model is not called and the answer is: "I couldn't find sufficient information in your uploaded documents to answer that question."
+
+### Citations
+
+The model is given each passage with a short id (`S1`, `S2`…) and must answer in a strict JSON schema: `found_answer`, `answer` (with `[S1]` markers), and `citations` (each a source id and a short quote). Nothing it returns is trusted:
+
+- every id is looked up in that request's own passages; an id that was not supplied is removed from the text and from the list;
+- every citation is built from the stored chunk (its real document ID, name, chunk ID and page, paragraph or line references), never from anything the model wrote;
+- the model's quote is shown only if it really appears in the passage; otherwise the start of the passage is shown;
+- an answer left with no valid citation is treated as unsupported and replaced with the standard "couldn't find" reply;
+- markers are renumbered `[1]`, `[2]`… in order of first use, matching the citation numbers.
+
+In the web app each marker is a button that opens its source card, which shows the document name, the page, paragraph or line range, the excerpt, and a download link.
+
+### Prompt injection
+
+Document text is evidence, never instructions.
+
+- The instructions (`app/services/prompts.py`) go in the Responses API's `instructions`; passages go in the user turn. The instructions tell the model to treat passages as untrusted data, never to follow instructions inside them, and never to reveal its instructions.
+- Passages are wrapped in tags with a **random suffix chosen per request**, such as `<source-3f9a…>`. A document cannot know it, so text inside a document cannot close the tags or forge a new source.
+- The output is checked: invented source ids are removed (above), and an answer that repeats the instructions or the request's tag name is replaced.
+- The model has no tools, so a successful injection could at worst change the wording of one answer to the user who uploaded or can read that document.
+
+### Conversation history
+
+Up to `CHAT_HISTORY_MESSAGES` (10) earlier messages, within `CHAT_HISTORY_TOKENS` (2,000), newest kept first, in their original order, always starting with a question. Only message text is sent: no citations, metadata or anything internal. The instructions say earlier answers are not evidence.
+
+### One answer at a time, retries and failures
+
+- **Per-conversation lease.** While an answer is being written, the conversation records which question it is for and since when (`generating_message_id`, `generating_since`, migration `0006`). A second question in the same conversation gets `409 conversation_busy` and is not stored. The lease is taken and released in short transactions, so no database lock or connection is held while OpenAI works, and it expires after `CHAT_GENERATION_LEASE_SECONDS` (300), so a crash cannot block a conversation.
+- **Idempotency.** Send a `client_message_id` and reuse it to retry. If that question already has an answer, the stored question and answer come back with `200` and the model is not called again. If its answer failed, the stored question is answered again; it is never stored twice. The same ID sent twice at once gets `409 answer_in_progress` for the second request.
+- **Failures keep the question and invent nothing.** If retrieval, the model or saving fails, the question stays stored, no assistant message is created, and the lease is released. The web app then offers **Try again**, which reuses the same ID.
+
+| Code | Status | Meaning | Question kept |
+|---|---|---|---|
+| `ai_not_configured` | 503 | No `OPENAI_API_KEY`. Checked before anything is stored. | No |
+| `conversation_busy` | 409 | Another answer is being written here. | No |
+| `answer_in_progress` | 409 | This question's answer is being written. | Yes |
+| `ai_unavailable` | 503 | Rate limited, timed out or an OpenAI server error, after retries. | Yes |
+| `ai_misconfigured` | 503 | OpenAI rejected the key, permissions or model name. | Yes |
+| `ai_rejected` | 502 | OpenAI refused this request. | Yes |
+| `ai_invalid_response` | 502 | The output did not match the schema or was cut off. | Yes |
+| `embeddings_unavailable` | 503 | The question could not be embedded. | Yes |
+| `answer_not_saved` | 500 | The answer could not be stored. | Yes |
+
+Rate limits, timeouts, connection errors and 5xx responses are retried up to `CHAT_MAX_ATTEMPTS` (3) with exponential backoff and jitter, honouring `Retry-After`; each request has a `CHAT_TIMEOUT_SECONDS` (45) timeout. Authentication, permission, model-not-found and other 4xx errors are not retried. The SDK's own retries are off, so attempts are bounded and logged in one place.
+
+### OpenAI configuration
+
+`OPENAI_API_KEY` (server only) and `OPENAI_CHAT_MODEL` (default `gpt-4.1-mini`). No code names a model: change the setting to change models. Requests use the Responses API with a strict JSON schema, `temperature` 0.2, at most 1,000 output tokens, and `store: false`, so conversations are not kept on OpenAI's side. Every answer stores the model that produced it, its token counts and `PROMPT_VERSION`; none of these, nor retrieval scores, are returned to clients. Neither questions, documents, answers nor the key are logged, only IDs, counts and error types.
+
+### Limitations of answering
+
+- **No streaming.** The answer arrives whole, after a few seconds. Streaming is a later milestone.
+- **One answer at a time per conversation.** Questions in other conversations are answered in parallel.
+- **A question that was never answered stays without an answer** until it is retried.
+- **The similarity threshold is not tuned** beyond one document (see above).
+- **Every answer must cite.** A reply such as "thanks" gets the standard "couldn't find" reply, because there is nothing to cite.
+- **Vector search only,** as for search: exact codes or names can rank below loosely related text.
+- **The excerpt is short,** a quote or the start of the passage, not the whole passage.
+- **No answer feedback, editing or regeneration** yet, and **no rate limit or cost cap** per user.
 
 ## Configuration
 
@@ -399,7 +530,7 @@ uv run alembic revision --autogenerate -m "describe the change"
 uv run alembic downgrade -1
 ```
 
-Migrations so far: `0001` pgvector, `0002` workspaces and members, `0003` documents, `0004` document chunks, `0005` conversations and messages. `0005` only adds two tables and changes no existing one. The API container applies pending migrations when it starts, so `docker compose up --build -d` is enough to upgrade.
+Migrations so far: `0001` pgvector, `0002` workspaces and members, `0003` documents, `0004` document chunks, `0005` conversations and messages, `0006` the answer lease (two nullable columns on `conversations`). Neither `0005` nor `0006` changes existing data. The API container applies pending migrations when it starts, so `docker compose up --build -d` is enough to upgrade.
 
 For autogenerate to see a new model, import its module in `app/models/__init__.py`.
 
@@ -417,7 +548,7 @@ Each log line includes that request ID, so an error a user reports can be matche
 
 Ruff lints and formats the API; ESLint lints and Prettier formats the web app (`npm run format` to apply).
 
-The API's workspace tests run against real Postgres, so start the database first (`docker compose up -d db`). They create and use a separate `knowledgepilot_test` database and never touch your development data. Authentication tests sign real tokens with a throwaway key and mock the JWKS endpoint, file storage is replaced by an in-memory fake, and OpenAI is mocked, so no test needs a Supabase project, an OpenAI key, or calls either service. The embedding client is tested through the real OpenAI SDK against a scripted HTTP response. Vectors are real: chunk and search tests write to a `vector(1536)` column and rank with pgvector's cosine distance. If the test database stops responding, the run aborts at once with a message instead of waiting. Test PDF and DOCX files are generated on the fly; none are stored in the repository. The web tests use Vitest with Testing Library.
+The API's workspace tests run against real Postgres, so start the database first (`docker compose up -d db`). They create and use a separate `knowledgepilot_test` database and never touch your development data. Authentication tests sign real tokens with a throwaway key and mock the JWKS endpoint, file storage is replaced by an in-memory fake, and OpenAI is mocked (a deterministic fake model, and the real OpenAI SDK against a scripted HTTP server), so no test needs a Supabase project, an OpenAI key, or calls either service. The embedding client is tested through the real OpenAI SDK against a scripted HTTP response. Vectors are real: chunk and search tests write to a `vector(1536)` column and rank with pgvector's cosine distance. If the test database stops responding, the run aborts at once with a message instead of waiting. Test PDF and DOCX files are generated on the fly; none are stored in the repository. The web tests use Vitest with Testing Library.
 
 ```sh
 cd apps/api && uv run pytest && uv run ruff check . && uv run ruff format --check .

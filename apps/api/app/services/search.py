@@ -65,7 +65,26 @@ async def search(
         logger.error("Query embedding failed (retryable: %s)", error.retryable)
         raise embeddings_unavailable() from error
 
-    distance = DocumentChunk.embedding.cosine_distance(query_vector)
+    return await nearest(
+        session, workspace_id, user_id, query_vector, top_k, document_ids, min_similarity
+    )
+
+
+async def nearest(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    user_id: uuid.UUID,
+    vector: list[float],
+    top_k: int,
+    document_ids: list[uuid.UUID],
+    min_similarity: float,
+) -> list[Match]:
+    """The chunks closest to `vector` in one workspace, from ready documents only.
+
+    Used by search and by question answering alike, so both get the same tenant isolation:
+    the caller's membership is part of the query itself.
+    """
+    distance = DocumentChunk.embedding.cosine_distance(vector)
     statement = (
         # Only the columns the response needs: never the vector, the workspace, or metadata.
         select(

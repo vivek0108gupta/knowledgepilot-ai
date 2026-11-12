@@ -1,5 +1,7 @@
 """Stand-ins for the services outside this process: file storage and the processing queue."""
 
+import asyncio
+import json
 import math
 import re
 import uuid
@@ -101,3 +103,55 @@ class FakeEmbedder:
             raise self.fail
         self.calls.append(list(texts))
         return [fake_vector(text) for text in texts]
+
+
+SOURCE_BLOCK = re.compile(
+    r'<source-(?P<boundary>[0-9a-f]+) id="(?P<id>S\d+)"[^>]*>\n'
+    r"(?P<content>.*?)\n</source-(?P=boundary)>",
+    re.S,
+)
+
+
+def sources_in(turns: list) -> list[tuple[str, str]]:  # noqa: ANN001
+    """The (id, text) of every passage in the last turn, as the model would see them."""
+    return [(m.group("id"), m.group("content")) for m in SOURCE_BLOCK.finditer(turns[-1].content)]
+
+
+def grounded_reply(call: dict) -> str:
+    """Answers from the first passage, citing it with a quote taken from it."""
+    sources = sources_in(call["turns"])
+    source_id, content = sources[0]
+    quote = " ".join(content.split()[:8])
+    return json.dumps(
+        {
+            "found_answer": True,
+            "answer": f"According to the documents, {quote} [{source_id}].",
+            "citations": [{"source_id": source_id, "quote": quote}],
+        }
+    )
+
+
+class FakeChatModel:
+    """A stand-in for the language model: deterministic, recording every request."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+        self.fail: Exception | None = None
+        self.refuse = False
+        self.delay = 0.0
+        # Builds the raw output from the request. Defaults to citing the first passage.
+        self.reply = grounded_reply
+
+    async def generate(self, *, instructions, turns, schema, schema_name):  # noqa: ANN001, ANN201
+        from app.services.llm import Generation
+
+        call = {"instructions": instructions, "turns": list(turns), "schema": schema}
+        self.calls.append(call)
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.fail is not None:
+            raise self.fail
+        text = "" if self.refuse else self.reply(call)
+        return Generation(
+            text=text, refused=self.refuse, model="fake-model-1", input_tokens=120, output_tokens=30
+        )

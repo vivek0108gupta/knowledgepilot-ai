@@ -10,7 +10,6 @@ neither is the API key.
 import asyncio
 import logging
 import math
-import random
 from collections.abc import Awaitable, Callable
 from functools import lru_cache
 from typing import Protocol
@@ -21,13 +20,13 @@ from openai import AsyncOpenAI
 from app.core.config import get_settings
 from app.core.errors import AppError
 from app.models.chunk import EMBEDDING_DIMENSIONS
+from app.services.openai_client import TRANSIENT_ERRORS, backoff_delay, openai_client
 
 logger = logging.getLogger(__name__)
 
 # OpenAI accepts up to 2,048 inputs and 300,000 tokens per request. At 800 tokens a chunk,
 # 64 inputs is about 51,000 tokens, comfortably inside both limits.
 MAX_BATCH_SIZE = 256
-MAX_RETRY_DELAY_SECONDS = 30.0
 
 
 class EmbeddingError(Exception):
@@ -46,15 +45,6 @@ class Embedder(Protocol):
 
 EmbedderProvider = Callable[[], Embedder]
 Sleep = Callable[[float], Awaitable[None]]
-
-
-def retry_after_seconds(error: openai.APIStatusError) -> float | None:
-    """The wait the API asked for, if it sent a usable Retry-After header."""
-    try:
-        value = float(error.response.headers.get("retry-after", ""))
-    except (ValueError, AttributeError):
-        return None
-    return value if 0 <= value <= MAX_RETRY_DELAY_SECONDS else None
 
 
 class OpenAIEmbedder:
@@ -101,12 +91,7 @@ class OpenAIEmbedder:
         for attempt in range(1, self._max_attempts + 1):
             try:
                 return await self._request(batch)
-            except (
-                openai.RateLimitError,
-                openai.APITimeoutError,
-                openai.APIConnectionError,
-                openai.InternalServerError,
-            ) as error:
+            except TRANSIENT_ERRORS as error:
                 # Worth another try: the request itself was fine.
                 if attempt == self._max_attempts:
                     logger.error(
@@ -141,10 +126,7 @@ class OpenAIEmbedder:
 
     def _delay(self, attempt: int, error: Exception) -> float:
         """Exponential backoff with jitter, or the wait the API asked for if that is longer."""
-        backoff = min(self._base_delay * 2 ** (attempt - 1), MAX_RETRY_DELAY_SECONDS)
-        backoff *= 0.5 + random.random() / 2  # noqa: S311 - jitter, not security
-        asked = retry_after_seconds(error) if isinstance(error, openai.APIStatusError) else None
-        return max(backoff, asked or 0.0)
+        return backoff_delay(attempt, self._base_delay, error)
 
     async def _request(self, batch: list[str]) -> list[list[float]]:
         # The SDK's own retries are switched off (see `get_embedder`), so retries happen
@@ -211,7 +193,7 @@ def get_embedder() -> Embedder:
             "embeddings_misconfigured",
             "The embedding size does not match the database.",
         )
-    client = AsyncOpenAI(api_key=api_key, max_retries=0, timeout=settings.embedding_timeout_seconds)
+    client = openai_client(api_key).with_options(timeout=settings.embedding_timeout_seconds)
     return OpenAIEmbedder(
         client,
         model=settings.embedding_model,

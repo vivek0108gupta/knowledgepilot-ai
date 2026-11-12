@@ -53,6 +53,26 @@ class Settings(BaseSettings):
     # yet, and no code names a model directly, so changing models is a setting change.
     openai_chat_model: str = "gpt-4.1-mini"
 
+    # Answering questions from documents (retrieval-augmented generation).
+    chat_temperature: float = 0.2
+    chat_max_output_tokens: int = 1000
+    chat_timeout_seconds: float = 45.0
+    chat_max_attempts: int = 3
+    # Passages retrieved per question, and the most a request may ask for.
+    chat_top_k: int = 5
+    chat_max_top_k: int = 10
+    # Passages less similar than this are not given to the model. The same scale as
+    # SEARCH_MIN_SIMILARITY; an estimate, to be tuned against real questions.
+    chat_min_similarity: float = 0.2
+    # Token budgets for what the model is shown: retrieved passages, and earlier turns.
+    chat_context_tokens: int = 6000
+    chat_max_chunks_per_document: int = 3
+    chat_history_messages: int = 10
+    chat_history_tokens: int = 2000
+    # How long one answer may hold a conversation before another request may take over.
+    # Longer than the worst case of chat_timeout_seconds x chat_max_attempts plus backoff.
+    chat_generation_lease_seconds: int = 300
+
     # Chunking, measured in tokens of the embedding model.
     chunk_size_tokens: int = 800
     chunk_overlap_tokens: int = 100

@@ -73,6 +73,12 @@ class Conversation(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=utc_now
     )
+    # Set while an answer is being written: the user message being answered, and since when.
+    # Only one answer is written at a time per conversation. It is a lease, not a lock: it
+    # expires (CHAT_GENERATION_LEASE_SECONDS), so a crash mid-answer cannot block the
+    # conversation for ever, and no database lock is held while the model is working.
+    generating_message_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
+    generating_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Message(Base):

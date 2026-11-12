@@ -35,13 +35,14 @@ from sqlalchemy import text  # noqa: E402
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine  # noqa: E402
 from sqlalchemy.pool import NullPool  # noqa: E402
 
+from app.api.v1.chat import get_chat_model_provider  # noqa: E402
 from app.api.v1.documents import get_storage_provider  # noqa: E402
 from app.api.v1.search import get_embedder_provider  # noqa: E402
 from app.core.db import get_session  # noqa: E402
 from app.main import app  # noqa: E402
 from app.services.processing import get_processing_queue, process_document  # noqa: E402
 from tests.auth import JWKS  # noqa: E402
-from tests.fakes import FakeEmbedder, FakeStorage, RecordingQueue  # noqa: E402
+from tests.fakes import FakeChatModel, FakeEmbedder, FakeStorage, RecordingQueue  # noqa: E402
 
 API_ROOT = Path(__file__).resolve().parent.parent
 
@@ -146,6 +147,12 @@ def embedder() -> FakeEmbedder:
 
 
 @pytest.fixture
+def chat_model() -> FakeChatModel:
+    """A deterministic stand-in for the language model."""
+    return FakeChatModel()
+
+
+@pytest.fixture
 def queue() -> RecordingQueue:
     """Records queued documents; tests run processing explicitly with `process`."""
     return RecordingQueue()
@@ -174,6 +181,7 @@ async def db_client(
     storage: FakeStorage,
     queue: RecordingQueue,
     embedder: FakeEmbedder,
+    chat_model: FakeChatModel,
 ) -> AsyncIterator[AsyncClient]:
     """An HTTP client whose requests run against the real test database.
 
@@ -188,6 +196,7 @@ async def db_client(
     app.dependency_overrides[get_storage_provider] = lambda: lambda: storage
     app.dependency_overrides[get_processing_queue] = lambda: queue
     app.dependency_overrides[get_embedder_provider] = lambda: lambda: embedder
+    app.dependency_overrides[get_chat_model_provider] = lambda: lambda: chat_model
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as http:
         yield http

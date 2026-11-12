@@ -6,6 +6,7 @@ from fastapi import APIRouter, Query, Response, status
 from app.api.deps import CurrentUser, DbSession
 from app.models.conversation import ConversationStatus, Message
 from app.schemas.conversation import (
+    CitationOut,
     ConversationCreate,
     ConversationOut,
     ConversationPage,
@@ -33,16 +34,24 @@ def to_out(view: ConversationView) -> ConversationOut:
     )
 
 
+# Metadata keys a client may see. Everything else stored with a message stays internal.
+PUBLIC_METADATA_KEYS = ("grounded",)
+
+
 def message_out(message: Message) -> MessageOut:
-    # Built field by field: token counts, the model name and the client's idempotency ID
-    # are internal and are not returned.
+    # Built field by field: token counts and the client's idempotency ID are internal, and so
+    # are most metadata keys (the prompt version and retrieval scores, for instance).
+    stored = message.message_metadata or {}
+    public = {key: stored[key] for key in PUBLIC_METADATA_KEYS if key in stored}
     return MessageOut(
         id=message.id,
         conversation_id=message.conversation_id,
         role=message.role,  # type: ignore[arg-type]
         content=message.content,
         sequence_number=message.sequence_number,
-        metadata=message.message_metadata,
+        metadata=public or None,
+        model=message.model,
+        citations=[CitationOut.model_validate(item) for item in stored.get("citations") or []],
         created_at=message.created_at,
     )
 

@@ -4,7 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 
 import { ApiError } from "@/lib/api";
-import type { Conversation, Message, MessagePage } from "@/lib/conversations";
+import type { Citation, Conversation, Message, MessagePage } from "@/lib/conversations";
 import { renderWithQuery } from "@/test/render";
 
 import { ChatWorkspace } from "./chat";
@@ -25,12 +25,20 @@ const mocks = vi.hoisted(() => ({
   renameConversation: vi.fn(),
   deleteConversation: vi.fn(),
   listMessages: vi.fn(),
-  sendMessage: vi.fn(),
+  askQuestion: vi.fn(),
+  getDownload: vi.fn(),
+  startDownload: vi.fn(),
 }));
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: mocks.push, replace: mocks.replace }),
   useParams: () => mocks.params,
+}));
+
+vi.mock("@/lib/documents", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/documents")>()),
+  getDownload: mocks.getDownload,
+  startDownload: mocks.startDownload,
 }));
 
 vi.mock("@/lib/workspaces", async (importOriginal) => ({
@@ -46,7 +54,7 @@ vi.mock("@/lib/conversations", async (importOriginal) => ({
   renameConversation: mocks.renameConversation,
   deleteConversation: mocks.deleteConversation,
   listMessages: mocks.listMessages,
-  sendMessage: mocks.sendMessage,
+  askQuestion: mocks.askQuestion,
 }));
 
 function conversation(id: string, title: string, workspaceId = WORKSPACE): Conversation {
@@ -69,6 +77,8 @@ function message(sequence: number, content: string, role: Message["role"] = "use
     content,
     sequence_number: sequence,
     metadata: null,
+    model: null,
+    citations: [],
     created_at: "2026-11-11T09:30:00Z",
   };
 }
@@ -212,13 +222,12 @@ describe("opening a conversation", () => {
     expect(await screen.findByRole("status", { name: "Loading conversation" })).toBeInTheDocument();
   });
 
-  test("a new conversation shows an empty state that is honest about AI answers", async () => {
+  test("a new conversation shows an empty state that explains what answers are based on", async () => {
     open(FIRST);
 
     expect(await screen.findByRole("heading", { name: "No messages yet" })).toBeInTheDocument();
-    expect(
-      screen.getByText(/AI answers are not available yet; they arrive in the next milestone/),
-    ).toBeInTheDocument();
+    expect(screen.getByText(/Answers come only from those documents/)).toBeInTheDocument();
+    expect(screen.getByText(/Only you can see this conversation/)).toBeInTheDocument();
     expect(composer()).toBeEnabled();
   });
 
@@ -299,42 +308,98 @@ describe("opening a conversation", () => {
   });
 });
 
-describe("sending a message", () => {
-  test("sends the text with an idempotency ID, then shows what the server stored", async () => {
-    const stored = message(1, "What is the refund policy?");
-    mocks.sendMessage.mockResolvedValue(stored);
-    mocks.listMessages.mockResolvedValueOnce(page([])).mockResolvedValue(page([stored]));
+const REFUND_DOC = "66666666-6666-4666-8666-666666666666";
+const NOTES_DOC = "77777777-7777-4777-8777-777777777777";
+
+function citation(number: number, overrides: Partial<Citation> = {}): Citation {
+  return {
+    number,
+    document_id: REFUND_DOC,
+    document_name: "refund-policy.pdf",
+    chunk_id: `88888888-8888-4888-8888-${String(number).padStart(12, "0")}`,
+    page_number: 4,
+    paragraph_index: null,
+    line_start: null,
+    line_end: null,
+    excerpt: "Customers can request a refund within 30 days of purchase.",
+    ...overrides,
+  };
+}
+
+function answer(sequence: number, content: string, citations: Citation[] = [], grounded = true): Message {
+  return {
+    ...message(sequence, content, "assistant"),
+    model: "gpt-4.1-mini",
+    metadata: { grounded },
+    citations,
+  };
+}
+
+function chatResult(question: string, reply: Message, sequence = 1) {
+  return { conversation_id: FIRST, user_message: message(sequence, question), assistant_message: reply };
+}
+
+describe("asking a question", () => {
+  test("sends the question with an idempotency ID, then shows the stored question and answer", async () => {
+    mocks.askQuestion.mockResolvedValue(
+      chatResult("What is the refund policy?", answer(2, "Refunds within 30 days [1].", [citation(1)])),
+    );
     open(FIRST);
     const user = userEvent.setup();
 
     await user.type(await screen.findByRole("textbox", { name: "Message" }), "What is the refund policy?");
     await user.click(screen.getByRole("button", { name: "Send" }));
 
-    expect(
-      await within(await screen.findByRole("list", { name: "Messages" })).findByText(
-        "What is the refund policy?",
-      ),
-    ).toBeInTheDocument();
-    const [conversationId, content, clientId] = mocks.sendMessage.mock.calls[0]!;
+    const list = await screen.findByRole("list", { name: "Messages" });
+    expect(await within(list).findByText("What is the refund policy?")).toBeInTheDocument();
+    expect(within(list).getByText(/Refunds within 30 days/)).toBeInTheDocument();
+    const [conversationId, content, clientId] = mocks.askQuestion.mock.calls[0]!;
     expect([conversationId, content]).toEqual([FIRST, "What is the refund policy?"]);
     expect(clientId).toMatch(/^[0-9a-f-]{36}$/);
-    await vi.waitFor(() => expect(composer()).toHaveValue(""));
+    expect(composer()).toHaveValue("");
+  });
+
+  test("shows the question and a progress message while the answer is written", async () => {
+    let finish: (value: unknown) => void = () => {};
+    mocks.askQuestion.mockReturnValue(new Promise((resolve) => (finish = resolve)));
+    open(FIRST);
+    const user = userEvent.setup();
+    const box = await screen.findByRole("textbox", { name: "Message" });
+
+    await user.type(box, "What is the refund policy?{Enter}");
+
+    expect(await screen.findByText("What is the refund policy?")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Searching your documents and writing an answer…");
+    const sending = screen.getByRole("button", { name: "Answering…" });
+    expect(sending).toBeDisabled();
+    expect(sending).toHaveAttribute("aria-busy", "true");
+    expect(box).toBeDisabled();
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(mocks.askQuestion).toHaveBeenCalledTimes(1);
+
+    finish(chatResult("What is the refund policy?", answer(2, "Refunds within 30 days [1].", [citation(1)])));
+
+    expect(await screen.findByText(/Refunds within 30 days/)).toBeInTheDocument();
+    expect(screen.queryByText("Searching your documents and writing an answer…")).not.toBeInTheDocument();
+    await vi.waitFor(() => expect(screen.getByRole("button", { name: "Send" })).toBeEnabled());
   });
 
   test("Enter sends and Shift+Enter makes a new line", async () => {
-    mocks.sendMessage.mockResolvedValue(message(1, "line one\nline two"));
+    mocks.askQuestion.mockResolvedValue(
+      chatResult("line one\nline two", answer(2, "ok [1].", [citation(1)])),
+    );
     open(FIRST);
     const user = userEvent.setup();
     const box = await screen.findByRole("textbox", { name: "Message" });
 
     await user.type(box, "line one{Shift>}{Enter}{/Shift}line two");
     expect(box).toHaveValue("line one\nline two");
-    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.askQuestion).not.toHaveBeenCalled();
 
     await user.type(box, "{Enter}");
 
-    await vi.waitFor(() => expect(mocks.sendMessage).toHaveBeenCalledTimes(1));
-    expect(mocks.sendMessage.mock.calls[0]![1]).toBe("line one\nline two");
+    await vi.waitFor(() => expect(mocks.askQuestion).toHaveBeenCalledTimes(1));
+    expect(mocks.askQuestion.mock.calls[0]![1]).toBe("line one\nline two");
   });
 
   test("Enter does not send while an input method is still composing", async () => {
@@ -344,10 +409,10 @@ describe("sending a message", () => {
 
     fireEvent.keyDown(box, { key: "Enter", isComposing: true });
 
-    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.askQuestion).not.toHaveBeenCalled();
   });
 
-  test.each(["", "   ", "\n\n"])("an empty or blank message %j is not sent", async (draft) => {
+  test.each(["", "   ", "\n\n"])("an empty or blank question %j is not sent", async (draft) => {
     open(FIRST);
     const user = userEvent.setup();
     const box = await screen.findByRole("textbox", { name: "Message" });
@@ -357,7 +422,7 @@ describe("sending a message", () => {
 
     expect(screen.getByRole("alert")).toHaveTextContent("Write a message first.");
     expect(box).toBeInvalid();
-    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.askQuestion).not.toHaveBeenCalled();
   });
 
   test("the box cannot hold more than the API accepts", async () => {
@@ -366,71 +431,58 @@ describe("sending a message", () => {
     expect(await screen.findByRole("textbox", { name: "Message" })).toHaveAttribute("maxlength", "8000");
   });
 
-  test("is disabled while sending, and a second submit is ignored", async () => {
-    let finish: (value: Message) => void = () => {};
-    mocks.sendMessage.mockReturnValue(new Promise((resolve) => (finish = resolve)));
+  test("a follow-up is sent in the same conversation after the first answer", async () => {
+    mocks.askQuestion
+      .mockResolvedValueOnce(
+        chatResult(
+          "List the policies.",
+          answer(2, "Refunds [1] and shipping [2].", [citation(1), citation(2)]),
+        ),
+      )
+      .mockResolvedValueOnce(
+        chatResult("Explain the second point.", answer(4, "Shipping takes two days [1].", [citation(1)]), 3),
+      );
     open(FIRST);
     const user = userEvent.setup();
     const box = await screen.findByRole("textbox", { name: "Message" });
 
-    await user.type(box, "hello{Enter}");
+    await user.type(box, "List the policies.{Enter}");
+    await screen.findByText(/Refunds/);
+    await user.type(box, "Explain the second point.{Enter}");
 
-    const sending = await screen.findByRole("button", { name: "Sending…" });
-    expect(sending).toBeDisabled();
-    expect(sending).toHaveAttribute("aria-busy", "true");
-    expect(box).toBeDisabled();
-    fireEvent.keyDown(box, { key: "Enter" });
-    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
-
-    finish(message(1, "hello"));
-    await vi.waitFor(() => expect(screen.getByRole("button", { name: "Send" })).toBeEnabled());
+    expect(await screen.findByText(/Shipping takes two days/)).toBeInTheDocument();
+    expect(mocks.askQuestion.mock.calls.map((call) => call.slice(0, 2))).toEqual([
+      [FIRST, "List the policies."],
+      [FIRST, "Explain the second point."],
+    ]);
+    expect(mocks.askQuestion.mock.calls[0]![2]).not.toBe(mocks.askQuestion.mock.calls[1]![2]);
   });
 
-  test("a failed send keeps the text, explains, and retries with the same idempotency ID", async () => {
-    mocks.sendMessage
-      .mockRejectedValueOnce(new ApiError(0, "network_error", "Could not reach the server."))
-      .mockResolvedValueOnce(message(1, "important question"));
+  test("the answer survives a refresh, because it comes from the stored history", async () => {
+    mocks.listMessages.mockResolvedValue(
+      page([
+        message(1, "What is the refund policy?"),
+        answer(2, "Refunds within 30 days [1].", [citation(1)]),
+      ]),
+    );
     open(FIRST);
-    const user = userEvent.setup();
-    const box = await screen.findByRole("textbox", { name: "Message" });
 
-    await user.type(box, "important question{Enter}");
-
-    const alert = await screen.findByRole("alert");
-    expect(alert).toHaveTextContent("Could not reach the server.");
-    expect(alert).toHaveTextContent("Your message is still in the box");
-    expect(box).toHaveValue("important question");
-    expect(box).toBeEnabled();
-
-    await user.click(screen.getByRole("button", { name: "Send" }));
-
-    await vi.waitFor(() => expect(mocks.sendMessage).toHaveBeenCalledTimes(2));
-    // Same ID both times: if the first attempt did reach the server, it is not stored twice.
-    expect(mocks.sendMessage.mock.calls[1]![2]).toBe(mocks.sendMessage.mock.calls[0]![2]);
+    const list = await screen.findByRole("list", { name: "Messages" });
+    expect(within(list).getByText(/Refunds within 30 days/)).toBeInTheDocument();
+    expect(within(list).getByRole("button", { name: "Show source 1" })).toBeInTheDocument();
+    expect(within(list).getByText("refund-policy.pdf")).toBeInTheDocument();
   });
 
-  test("a different message gets a different idempotency ID", async () => {
-    mocks.sendMessage.mockImplementation(async (_id: string, content: string) => message(1, content));
-    open(FIRST);
-    const user = userEvent.setup();
-    const box = await screen.findByRole("textbox", { name: "Message" });
-
-    await user.type(box, "first{Enter}");
-    await vi.waitFor(() => expect(box).toHaveValue(""));
-    await user.type(box, "second{Enter}");
-
-    await vi.waitFor(() => expect(mocks.sendMessage).toHaveBeenCalledTimes(2));
-    expect(mocks.sendMessage.mock.calls[0]![2]).not.toBe(mocks.sendMessage.mock.calls[1]![2]);
-  });
-
-  test("sending refreshes the list and the heading, so an automatic title appears", async () => {
+  test("asking refreshes the list and the heading, so an automatic title appears", async () => {
     mocks.listConversations
       .mockResolvedValueOnce(list([conversation(FIRST, "New conversation")]))
       .mockResolvedValue(list([conversation(FIRST, "What is the refund policy?")]));
     mocks.getConversation
       .mockResolvedValueOnce(conversation(FIRST, "New conversation"))
       .mockResolvedValue(conversation(FIRST, "What is the refund policy?"));
-    mocks.sendMessage.mockResolvedValue(message(1, "What is the refund policy?"));
+    mocks.askQuestion.mockResolvedValue(
+      chatResult("What is the refund policy?", answer(2, "ok [1].", [citation(1)])),
+    );
     open(FIRST);
     const user = userEvent.setup();
 
@@ -452,6 +504,244 @@ describe("sending a message", () => {
 
     expect(await screen.findByRole("textbox", { name: "Message" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+  });
+});
+
+describe("when answering fails", () => {
+  test("a stored question offers Try again, which reuses its ID so it is not stored twice", async () => {
+    mocks.askQuestion
+      .mockRejectedValueOnce(
+        new ApiError(
+          503,
+          "ai_unavailable",
+          "The AI service is busy or unreachable. Your question was saved; try again shortly.",
+        ),
+      )
+      .mockResolvedValueOnce(chatResult("important question", answer(2, "Here it is [1].", [citation(1)])));
+    mocks.listMessages
+      .mockResolvedValueOnce(page([]))
+      .mockResolvedValue(page([message(1, "important question")]));
+    open(FIRST);
+    const user = userEvent.setup();
+    const box = await screen.findByRole("textbox", { name: "Message" });
+
+    await user.type(box, "important question{Enter}");
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Your question was saved");
+    // The question is in the conversation already, so the box is free for something else.
+    expect(box).toHaveValue("");
+    expect(
+      await within(screen.getByRole("list", { name: "Messages" })).findByText("important question"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Assistant said:")).not.toBeInTheDocument();
+
+    await user.click(within(alert).getByRole("button", { name: "Try again" }));
+
+    expect(await screen.findByText(/Here it is/)).toBeInTheDocument();
+    expect(mocks.askQuestion.mock.calls[1]!.slice(1)).toEqual(mocks.askQuestion.mock.calls[0]!.slice(1));
+  });
+
+  test.each([
+    ["ai_misconfigured", 503, "Answering is not available right now. Your question was saved."],
+    [
+      "ai_invalid_response",
+      502,
+      "The AI service returned an unusable answer. Your question was saved; try again.",
+    ],
+    ["embeddings_unavailable", 503, "Search is temporarily unavailable. Try again."],
+  ])("%s is explained, with a retry", async (code, status, message) => {
+    mocks.askQuestion.mockRejectedValue(new ApiError(status, code, message));
+    open(FIRST);
+
+    await userEvent.setup().type(await screen.findByRole("textbox", { name: "Message" }), "question{Enter}");
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(message);
+    expect(within(alert).getByRole("button", { name: "Try again" })).toBeInTheDocument();
+  });
+
+  test("a lost connection keeps the question retryable with the same ID", async () => {
+    mocks.askQuestion
+      .mockRejectedValueOnce(new ApiError(0, "network_error", "Could not reach the server."))
+      .mockResolvedValueOnce(chatResult("question", answer(2, "ok [1].", [citation(1)])));
+    open(FIRST);
+    const user = userEvent.setup();
+
+    await user.type(await screen.findByRole("textbox", { name: "Message" }), "question{Enter}");
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Could not reach the server.");
+    await user.click(within(alert).getByRole("button", { name: "Try again" }));
+
+    await vi.waitFor(() => expect(mocks.askQuestion).toHaveBeenCalledTimes(2));
+    expect(mocks.askQuestion.mock.calls[1]![2]).toBe(mocks.askQuestion.mock.calls[0]![2]);
+  });
+
+  test.each([
+    [new ApiError(409, "conversation_busy", "x"), "An answer is still being written. Wait for it to finish."],
+    [new ApiError(422, "validation_error", "x"), "That question could not be sent."],
+    [
+      new ApiError(503, "ai_not_configured", "x"),
+      "Answering questions has not been set up on the server yet.",
+    ],
+  ])("a question that was not stored goes back into the box", async (error, expected) => {
+    mocks.askQuestion.mockRejectedValue(error);
+    open(FIRST);
+    const box = await screen.findByRole("textbox", { name: "Message" });
+
+    await userEvent.setup().type(box, "unsent thought{Enter}");
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(expected);
+    expect(within(alert).queryByRole("button", { name: "Try again" })).not.toBeInTheDocument();
+    expect(box).toHaveValue("unsent thought");
+  });
+
+  test("resending the returned text reuses its ID", async () => {
+    mocks.askQuestion
+      .mockRejectedValueOnce(new ApiError(409, "conversation_busy", "x"))
+      .mockResolvedValueOnce(chatResult("unsent thought", answer(2, "ok [1].", [citation(1)])));
+    open(FIRST);
+    const user = userEvent.setup();
+    const box = await screen.findByRole("textbox", { name: "Message" });
+
+    await user.type(box, "unsent thought{Enter}");
+    await screen.findByRole("alert");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    await vi.waitFor(() => expect(mocks.askQuestion).toHaveBeenCalledTimes(2));
+    expect(mocks.askQuestion.mock.calls[1]![2]).toBe(mocks.askQuestion.mock.calls[0]![2]);
+  });
+
+  test("the server's raw text is not shown for an unexpected error", async () => {
+    mocks.askQuestion.mockRejectedValue(
+      new ApiError(500, "internal_error", "psycopg.OperationalError at db:5432"),
+    );
+    open(FIRST);
+
+    await userEvent.setup().type(await screen.findByRole("textbox", { name: "Message" }), "question{Enter}");
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Something went wrong.");
+    expect(alert).not.toHaveTextContent("psycopg");
+  });
+});
+
+describe("answers and their sources", () => {
+  async function showAnswer(reply: Message) {
+    mocks.listMessages.mockResolvedValue(page([message(1, "Question?"), reply]));
+    open(FIRST);
+    return screen.findByRole("list", { name: "Messages" });
+  }
+
+  test("each source is listed with its document name and page", async () => {
+    const list = await showAnswer(
+      answer(2, "Refunds take 30 days [1]. Shipping is quick [2].", [
+        citation(1),
+        citation(2, { document_id: NOTES_DOC, document_name: "shipping.pdf", page_number: 2 }),
+      ]),
+    );
+
+    const sources = within(within(list).getByRole("region", { name: "Sources" })).getAllByRole("listitem");
+    expect(sources).toHaveLength(2);
+    expect(sources[0]).toHaveTextContent("refund-policy.pdf");
+    expect(sources[0]).toHaveTextContent("Page 4");
+    expect(sources[1]).toHaveTextContent("shipping.pdf");
+    expect(sources[1]).toHaveTextContent("Page 2");
+  });
+
+  test.each([
+    [{ page_number: 4 }, "Page 4"],
+    [{ page_number: null, paragraph_index: 12 }, "Paragraph 13"],
+    [{ page_number: null, line_start: 10, line_end: 24 }, "Lines 10–24"],
+  ])("a source shows the reference its format has", async (overrides, label) => {
+    const list = await showAnswer(answer(2, "Answer [1].", [citation(1, overrides)]));
+
+    const source = within(within(list).getByRole("region", { name: "Sources" })).getByRole("listitem");
+    expect(source).toHaveTextContent(label);
+    if (!("page_number" in overrides) || overrides.page_number === null) {
+      expect(source).not.toHaveTextContent(/Page \d/);
+    }
+  });
+
+  test("the excerpt can be opened from the source card or from the marker in the answer", async () => {
+    const list = await showAnswer(answer(2, "Refunds take 30 days [1].", [citation(1)]));
+    const user = userEvent.setup();
+    const excerpt = within(list).getByText("Customers can request a refund within 30 days of purchase.");
+
+    expect(excerpt).not.toBeVisible();
+    await user.click(within(list).getByRole("button", { name: "Show excerpt" }));
+    expect(excerpt).toBeVisible();
+    await user.click(within(list).getByRole("button", { name: "Hide excerpt" }));
+    expect(excerpt).not.toBeVisible();
+
+    await user.click(within(list).getByRole("button", { name: "Show source 1" }));
+    expect(excerpt).toBeVisible();
+    expect(within(list).getByRole("button", { name: "Hide excerpt" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+  });
+
+  test("markers for several sources are each clickable", async () => {
+    const list = await showAnswer(
+      answer(2, "Both say so [1, 2].", [citation(1), citation(2, { document_name: "b.pdf" })]),
+    );
+
+    expect(within(list).getByRole("button", { name: "Show source 1" })).toBeInTheDocument();
+    expect(within(list).getByRole("button", { name: "Show source 2" })).toBeInTheDocument();
+    expect(within(list).getByText(/Both say so/)).toBeInTheDocument();
+  });
+
+  test("a marker with no matching source is shown as plain text", async () => {
+    const list = await showAnswer(answer(2, "Odd [3].", [citation(1)]));
+
+    expect(within(list).queryByRole("button", { name: "Show source 3" })).not.toBeInTheDocument();
+    expect(within(list).getAllByRole("listitem")[1]).toHaveTextContent("Odd [3].");
+  });
+
+  test("a source document can be downloaded through a signed link", async () => {
+    mocks.getDownload.mockResolvedValue({
+      url: "https://storage.test/signed?token=abc",
+      expires_in: 60,
+      filename: "refund-policy.pdf",
+    });
+    const list = await showAnswer(answer(2, "Refunds [1].", [citation(1)]));
+
+    await userEvent.setup().click(within(list).getByRole("button", { name: "Download refund-policy.pdf" }));
+
+    await vi.waitFor(() =>
+      expect(mocks.startDownload).toHaveBeenCalledWith("https://storage.test/signed?token=abc"),
+    );
+    expect(mocks.getDownload).toHaveBeenCalledWith(REFUND_DOC);
+  });
+
+  test("an answer the documents could not support is marked and has no sources", async () => {
+    const list = await showAnswer(
+      answer(
+        2,
+        "I couldn't find sufficient information in your uploaded documents to answer that question.",
+        [],
+        false,
+      ),
+    );
+
+    expect(within(list).getByText(/couldn't find sufficient information/)).toBeInTheDocument();
+    expect(within(list).getByText(/No supporting passage was found/)).toBeInTheDocument();
+    expect(within(list).queryByRole("region", { name: "Sources" })).not.toBeInTheDocument();
+  });
+
+  test("source excerpts and answers are shown as text, never run as markup", async () => {
+    const hostile = '<img src=x onerror="alert(1)"><script>alert(2)</script>';
+    const { container } = (() => {
+      mocks.listMessages.mockResolvedValue(
+        page([message(1, "Q"), answer(2, `${hostile} [1]`, [citation(1, { excerpt: hostile })])]),
+      );
+      return open(FIRST);
+    })();
+
+    await screen.findByRole("list", { name: "Messages" });
+    expect(container.querySelector("script, img")).toBeNull();
   });
 });
 
@@ -664,13 +954,15 @@ describe("authentication failure", () => {
   });
 
   test("an expired session while sending keeps the draft and says why", async () => {
-    mocks.sendMessage.mockRejectedValue(new ApiError(401, "token_expired", "The access token has expired."));
+    mocks.askQuestion.mockRejectedValue(new ApiError(401, "token_expired", "The access token has expired."));
     open(FIRST);
     const box = await screen.findByRole("textbox", { name: "Message" });
 
     await userEvent.setup().type(box, "unsent thought{Enter}");
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("The access token has expired.");
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Your session has expired. Sign in again to continue.",
+    );
     expect(box).toHaveValue("unsent thought");
   });
 });

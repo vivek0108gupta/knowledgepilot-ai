@@ -83,13 +83,33 @@ class MessageCreate(BaseModel):
     client_message_id: uuid.UUID | None = None
 
 
+class CitationOut(BaseModel):
+    """A source an answer relies on. Built by the server from the passage that was retrieved,
+    never from anything the model wrote."""
+
+    number: int
+    document_id: uuid.UUID
+    document_name: str
+    chunk_id: uuid.UUID
+    page_number: int | None = None
+    paragraph_index: int | None = None
+    line_start: int | None = None
+    line_end: int | None = None
+    excerpt: str
+
+
 class MessageOut(BaseModel):
     id: uuid.UUID
     conversation_id: uuid.UUID
     role: MessageRole
     content: str
     sequence_number: int
+    # For answers: {"grounded": bool}. Internal details (the prompt version, retrieval
+    # scores) are stored but not returned.
     metadata: dict[str, Any] | None = None
+    # The model that wrote an answer; null for the user's own messages.
+    model: str | None = None
+    citations: list[CitationOut] = Field(default_factory=list)
     created_at: datetime
 
 
@@ -99,6 +119,24 @@ class MessagePage(BaseModel):
     items: list[MessageOut]
     total: int
     has_more: bool
+
+
+class ChatRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message: MessageContent
+    # Reused when retrying, so a question is stored once and answered once.
+    client_message_id: uuid.UUID | None = None
+    # Restrict the evidence to these documents. Empty means the whole workspace.
+    document_ids: list[uuid.UUID] = Field(default_factory=list, max_length=50)
+    # Passages to retrieve. The upper bound is configurable (CHAT_MAX_TOP_K).
+    top_k: int | None = Field(default=None, ge=1)
+
+
+class ChatResponse(BaseModel):
+    conversation_id: uuid.UUID
+    user_message: MessageOut
+    assistant_message: MessageOut
 
 
 class MessageQuery(BaseModel):

@@ -13,12 +13,13 @@ import logging
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.errors import AppError
 from app.models.conversation import (
     DEFAULT_CONVERSATION_TITLE,
@@ -50,6 +51,51 @@ class CreatedMessage:
 
 def not_found() -> AppError:
     return AppError(404, "conversation_not_found", "Conversation not found.")
+
+
+def busy() -> AppError:
+    return AppError(
+        409,
+        "conversation_busy",
+        "An answer is still being written in this conversation. Wait for it to finish.",
+    )
+
+
+def archived() -> AppError:
+    return AppError(409, "conversation_archived", "Restore this conversation before adding to it.")
+
+
+def generation_active(conversation: Conversation, now: datetime | None = None) -> bool:
+    """True while an answer is being written in this conversation and its lease is current."""
+    if conversation.generating_message_id is None or conversation.generating_since is None:
+        return False
+    lease = timedelta(seconds=get_settings().chat_generation_lease_seconds)
+    return conversation.generating_since > (now or datetime.now(UTC)) - lease
+
+
+async def next_sequence(session: AsyncSession, conversation_id: uuid.UUID) -> int:
+    """The next message number. Only safe while holding the conversation's row lock."""
+    last = await session.scalar(
+        select(func.max(Message.sequence_number)).where(Message.conversation_id == conversation_id)
+    )
+    return (last or 0) + 1
+
+
+def name_from_first_message(conversation: Conversation, sequence_number: int, content: str) -> None:
+    if sequence_number == 1 and conversation.title == DEFAULT_CONVERSATION_TITLE:
+        # Only the untouched default is replaced; a title the user chose is left alone.
+        conversation.title = title_from_message(content)
+
+
+async def find_by_client_id(
+    session: AsyncSession, conversation_id: uuid.UUID, client_message_id: uuid.UUID
+) -> Message | None:
+    return await session.scalar(
+        select(Message).where(
+            Message.conversation_id == conversation_id,
+            Message.client_message_id == client_message_id,
+        )
+    )
 
 
 def title_from_message(content: str, limit: int = AUTO_TITLE_LENGTH) -> str:
@@ -266,12 +312,7 @@ async def add_user_message(
     conversation = await get_owned(session, conversation_id, user_id, lock=True)
 
     if client_message_id is not None:
-        existing = await session.scalar(
-            select(Message).where(
-                Message.conversation_id == conversation.id,
-                Message.client_message_id == client_message_id,
-            )
-        )
+        existing = await find_by_client_id(session, conversation.id, client_message_id)
         if existing is not None:
             same_message = existing.content == content and existing.role == MessageRole.USER.value
             # Detach the stored message before releasing the lock: ending the transaction
@@ -287,14 +328,12 @@ async def add_user_message(
             return CreatedMessage(existing, created=False)
 
     if conversation.status != ConversationStatus.ACTIVE.value:
-        raise AppError(
-            409, "conversation_archived", "Restore this conversation before adding to it."
-        )
+        raise archived()
+    # A message added mid-answer would land between the question and its answer.
+    if generation_active(conversation):
+        raise busy()
 
-    last = await session.scalar(
-        select(func.max(Message.sequence_number)).where(Message.conversation_id == conversation.id)
-    )
-    sequence_number = (last or 0) + 1
+    sequence_number = await next_sequence(session, conversation.id)
 
     message = Message(
         id=uuid.uuid4(),
@@ -306,9 +345,7 @@ async def add_user_message(
     )
     session.add(message)
 
-    if sequence_number == 1 and conversation.title == DEFAULT_CONVERSATION_TITLE:
-        # Only the untouched default is replaced; a title the user chose is left alone.
-        conversation.title = title_from_message(content)
+    name_from_first_message(conversation, sequence_number, content)
     conversation.updated_at = datetime.now(UTC)
 
     try:
