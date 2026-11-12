@@ -32,6 +32,15 @@ services:
       SUPABASE_SECRET_KEY: ${SUPABASE_SECRET_KEY:-}
       SUPABASE_STORAGE_BUCKET: ${SUPABASE_STORAGE_BUCKET:-knowledgepilot-documents}
       SIGNED_URL_TTL_SECONDS: ${SIGNED_URL_TTL_SECONDS:-60}
+      # OpenAI embeddings. Like the storage key, given to the API only, never to the web app.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
+      OPENAI_CHAT_MODEL: ${OPENAI_CHAT_MODEL:-gpt-4.1-mini}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1536}
+      CHUNK_SIZE_TOKENS: ${CHUNK_SIZE_TOKENS:-800}
+      CHUNK_OVERLAP_TOKENS: ${CHUNK_OVERLAP_TOKENS:-100}
+      SEARCH_MAX_TOP_K: ${SEARCH_MAX_TOP_K:-20}
+      SEARCH_MIN_SIMILARITY: ${SEARCH_MIN_SIMILARITY:-0.2}
     ports:
       - "${API_HOST_PORT:-8000}:8000"
     depends_on:

@@ -25,6 +25,7 @@ class Api:
         self.requests: list[httpx.Request] = []
         self.bodies: list[bytes] = []
         self.public = public
+        self.bad_key = False
         self.status: dict[str, int] = {}
         self.sign_body: dict[str, object] = {
             "signedURL": f"/object/sign/{BUCKET}/{PATH}?token=abc.def"
@@ -35,8 +36,16 @@ class Api:
         self.bodies.append(request.read())
         path = request.url.path
         if path == f"/storage/v1/bucket/{BUCKET}":
+            if self.bad_key:
+                # Exactly what Supabase sends: HTTP 400 with the real status in the body.
+                return httpx.Response(
+                    400, json={"statusCode": "403", "error": "Unauthorized", "code": "AccessDenied"}
+                )
             if self.public is None:
-                return httpx.Response(404, json={"message": "Bucket not found"})
+                return httpx.Response(
+                    400,
+                    json={"statusCode": "404", "error": "Bucket not found", "code": "NoSuchBucket"},
+                )
             return httpx.Response(
                 self.status.get("bucket", 200), json={"name": BUCKET, "public": self.public}
             )
@@ -109,8 +118,8 @@ async def test_signed_url_is_short_lived_absolute_and_forces_a_download() -> Non
 
     url = await api.client().create_signed_url(PATH, 60, "Quarterly report (final).pdf")
 
-    assert api.calls() == [("POST", f"/storage/v1/object/sign/{BUCKET}/{PATH}")]
-    assert json.loads(api.bodies[0]) == {"expiresIn": 60}
+    assert api.calls()[-1] == ("POST", f"/storage/v1/object/sign/{BUCKET}/{PATH}")
+    assert json.loads(api.bodies[-1]) == {"expiresIn": 60}
     assert url == (
         f"{BASE}/storage/v1/object/sign/{BUCKET}/{PATH}?token=abc.def"
         "&download=Quarterly%20report%20%28final%29.pdf"
@@ -142,8 +151,8 @@ async def test_delete_sends_the_paths_as_prefixes() -> None:
 
     await api.client().delete(["ws/doc-1/a.pdf", "ws/doc-2/b.txt"])
 
-    assert api.calls() == [("DELETE", f"/storage/v1/object/{BUCKET}")]
-    assert json.loads(api.bodies[0]) == {"prefixes": ["ws/doc-1/a.pdf", "ws/doc-2/b.txt"]}
+    assert api.calls()[-1] == ("DELETE", f"/storage/v1/object/{BUCKET}")
+    assert json.loads(api.bodies[-1]) == {"prefixes": ["ws/doc-1/a.pdf", "ws/doc-2/b.txt"]}
 
 
 async def test_delete_of_nothing_makes_no_request() -> None:
@@ -161,7 +170,7 @@ async def test_download_streams_into_the_destination() -> None:
     await api.client().download_to(PATH, destination)
 
     assert destination.getvalue() == b"file-bytes"
-    assert api.calls() == [("GET", f"/storage/v1/object/{BUCKET}/{PATH}")]
+    assert api.calls()[-1] == ("GET", f"/storage/v1/object/{BUCKET}/{PATH}")
 
 
 @pytest.mark.parametrize("operation", ["upload", "download", "delete", "sign"])
@@ -228,3 +237,54 @@ def test_the_secret_key_does_not_appear_when_settings_are_printed() -> None:
 
     assert SECRET not in repr(settings)
     assert SECRET not in str(settings.model_dump())
+
+
+OPERATIONS = ["upload", "download", "delete", "sign"]
+
+
+async def perform(client: SupabaseStorage, operation: str) -> None:
+    if operation == "upload":
+        await client.upload(PATH, io.BytesIO(b"x"), "text/plain", 1)
+    elif operation == "download":
+        await client.download_to(PATH, io.BytesIO())
+    elif operation == "delete":
+        await client.delete([PATH])
+    else:
+        await client.create_signed_url(PATH, 60, "a.pdf")
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+async def test_a_rejected_key_is_reported_as_a_credentials_problem_not_a_missing_bucket(
+    operation: str,
+) -> None:
+    api = Api()
+    api.bad_key = True
+
+    with pytest.raises(AppError) as caught:
+        await perform(api.client(), operation)
+
+    assert (caught.value.status_code, caught.value.code) == (503, "storage_credentials_invalid")
+    assert SECRET not in caught.value.message
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+async def test_every_operation_refuses_a_missing_bucket_before_acting(operation: str) -> None:
+    """Storage reports a delete in a missing bucket as a success, so it must never get that far."""
+    api = Api(public=None)
+
+    with pytest.raises(AppError) as caught:
+        await perform(api.client(), operation)
+
+    assert caught.value.code == "storage_bucket_missing"
+    assert [method for method, _ in api.calls()] == ["GET"]  # only the bucket check was sent
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+async def test_every_operation_refuses_a_public_bucket_before_acting(operation: str) -> None:
+    api = Api(public=True)
+
+    with pytest.raises(AppError) as caught:
+        await perform(api.client(), operation)
+
+    assert caught.value.code == "storage_bucket_public"
+    assert [method for method, _ in api.calls()] == ["GET"]

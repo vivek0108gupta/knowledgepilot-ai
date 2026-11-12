@@ -1,8 +1,13 @@
 """Stand-ins for the services outside this process: file storage and the processing queue."""
 
+import math
+import re
 import uuid
+import zlib
 from typing import BinaryIO
 
+from app.models.chunk import EMBEDDING_DIMENSIONS
+from app.services.embeddings import EmbeddingError
 from app.services.storage import StorageError
 
 
@@ -57,3 +62,42 @@ class RecordingQueue:
 
     def enqueue(self, document_id: uuid.UUID) -> None:
         self.enqueued.append(document_id)
+
+
+def fake_vector(text: str) -> list[float]:
+    """A deterministic 1536-dimension stand-in for a real embedding.
+
+    Each word adds weight to one dimension, so texts that share words point in similar
+    directions and texts that share none are orthogonal. That is enough for pgvector's
+    real cosine search to rank related passages first, without calling OpenAI.
+    """
+    vector = [0.0] * EMBEDDING_DIMENSIONS
+    for word in re.findall(r"[a-z0-9]+", text.lower()):
+        vector[zlib.crc32(word.encode()) % EMBEDDING_DIMENSIONS] += 1.0
+    norm = math.sqrt(sum(value * value for value in vector))
+    if norm == 0:
+        vector[0] = 1.0
+        return vector
+    return [value / norm for value in vector]
+
+
+class FakeEmbedder:
+    """Records what it was asked to embed, and can be told to fail."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+        self.fail: EmbeddingError | None = None
+        # Fail only once this many calls have succeeded (None: fail from the first call).
+        self.fail_after: int | None = None
+
+    @property
+    def texts(self) -> list[str]:
+        return [text for call in self.calls for text in call]
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        if self.fail is not None and (
+            self.fail_after is None or len(self.calls) >= self.fail_after
+        ):
+            raise self.fail
+        self.calls.append(list(texts))
+        return [fake_vector(text) for text in texts]

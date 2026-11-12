@@ -8,6 +8,7 @@ import { useState, type FormEvent } from "react";
 import { useAuth } from "@/components/auth/auth-provider";
 import { PageHeader } from "@/components/dashboard/shell";
 import { Documents } from "@/components/documents/documents";
+import { WorkspaceSearch } from "@/components/search/workspace-search";
 import { Button, buttonClass } from "@/components/ui/button";
 import { Alert, Badge, ErrorState, LoadingRegion, Skeleton } from "@/components/ui/feedback";
 import { SelectField, TextField } from "@/components/ui/field";
@@ -274,7 +275,7 @@ function DeleteWorkspace({ workspace }: { workspace: Workspace }) {
           setOpen(next);
         }}
         title={`Delete “${workspace.name}”?`}
-        description="This removes the workspace and all of its members for everyone. It cannot be undone."
+        description="This removes the workspace, its documents and its members for everyone. It cannot be undone."
       >
         {remove.isError && <Alert>{errorMessage(remove.error)}</Alert>}
         <div className="flex justify-end gap-2">
@@ -340,12 +341,18 @@ export function WorkspaceDetail() {
         title={data.name}
         description={`Your role: ${ROLE_LABELS[data.role]}`}
         action={
-          <Link href={WORKSPACES_PATH} className={buttonClass("secondary", "sm")}>
-            All workspaces
-          </Link>
+          <div className="flex flex-wrap gap-2">
+            <Link href={`${WORKSPACES_PATH}/${data.id}/chat`} className={buttonClass("primary", "sm")}>
+              Open chat
+            </Link>
+            <Link href={WORKSPACES_PATH} className={buttonClass("secondary", "sm")}>
+              All workspaces
+            </Link>
+          </div>
         }
       />
       <div className="flex flex-col gap-6">
+        <WorkspaceSearch key={data.id} workspace={data} />
         <Documents workspace={data} />
         {canEditWorkspace(data.role) && (
           <Section title="General">

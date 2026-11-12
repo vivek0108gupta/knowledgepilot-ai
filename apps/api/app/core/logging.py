@@ -41,6 +41,12 @@ def configure_logging(level: str = "INFO") -> None:
                 "uvicorn.error": {"handlers": [], "propagate": True},
                 # The request middleware logs each request, so uvicorn's access log is redundant.
                 "uvicorn.access": {"handlers": [], "propagate": False},
+                # These log every outgoing request URL at INFO. Storage URLs contain file
+                # names, so only their warnings and errors are kept.
+                "httpx": {"level": "WARNING"},
+                "httpx2": {"level": "WARNING"},
+                "httpcore": {"level": "WARNING"},
+                "openai": {"level": "WARNING"},
             },
         }
     )

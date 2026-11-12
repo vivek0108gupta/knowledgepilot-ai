@@ -58,6 +58,8 @@ class Document(Base):
         # The same file content is stored once per workspace.
         UniqueConstraint("workspace_id", "sha256", name="uq_documents_workspace_id_sha256"),
         UniqueConstraint("storage_path", name="uq_documents_storage_path"),
+        # Target of the composite foreign key from document_chunks (see models/chunk.py).
+        UniqueConstraint("id", "workspace_id", name="uq_documents_id_workspace_id"),
         # Listing a workspace's documents newest first, optionally filtered by status.
         Index("ix_documents_workspace_id_created_at", "workspace_id", "created_at"),
         Index("ix_documents_workspace_id_status", "workspace_id", "status"),

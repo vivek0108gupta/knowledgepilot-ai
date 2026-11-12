@@ -41,6 +41,7 @@ vi.mock("@/lib/workspaces", async (importOriginal) => ({
 
 // Documents have their own tests; here they would only add unrelated requests.
 vi.mock("@/components/documents/documents", () => ({ Documents: () => null }));
+vi.mock("@/components/search/workspace-search", () => ({ WorkspaceSearch: () => null }));
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: mocks.push, replace: mocks.replace }),
@@ -285,6 +286,11 @@ describe("workspace detail", () => {
     expect(mocks.deleteWorkspace).not.toHaveBeenCalled();
 
     const dialog = await screen.findByRole("dialog", { name: "Delete “Research”?" });
+    // The warning must say documents go too, now that workspaces hold them.
+    expect(dialog).toHaveTextContent(
+      "This removes the workspace, its documents and its members for everyone.",
+    );
+    expect(dialog).toHaveTextContent("It cannot be undone.");
     await user.click(within(dialog).getByRole("button", { name: "Delete workspace" }));
 
     await vi.waitFor(() => expect(mocks.replace).toHaveBeenCalledWith("/dashboard/workspaces"));

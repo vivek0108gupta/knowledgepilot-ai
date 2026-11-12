@@ -17,7 +17,7 @@ from app.services.processing import (
     recover_interrupted,
 )
 from tests.auth import auth
-from tests.fakes import FakeStorage, RecordingQueue
+from tests.fakes import FakeEmbedder, FakeStorage, RecordingQueue
 from tests.files import DOCX_MIME, TXT_MIME, make_docx, make_encrypted_pdf, make_pdf
 from tests.test_documents import API, upload_ok
 from tests.test_workspaces import add_member, create_workspace
@@ -255,6 +255,7 @@ class TestDuplicateProcessing:
         db_client: AsyncClient,
         db_engine: AsyncEngine,
         storage: FakeStorage,
+        embedder: FakeEmbedder,
         session_factory: async_sessionmaker,
         workspace: dict,
     ) -> None:
@@ -264,7 +265,10 @@ class TestDuplicateProcessing:
         document_id = uuid.UUID(document["id"])
 
         await asyncio.gather(
-            *(process_document(document_id, session_factory, lambda: storage) for _ in range(4))
+            *(
+                process_document(document_id, session_factory, lambda: storage, lambda: embedder)
+                for _ in range(4)
+            )
         )
 
         assert len(storage.downloads) == 1  # only one worker claimed it
@@ -429,6 +433,7 @@ class TestRecoveryAndQueue:
         self,
         db_client: AsyncClient,
         storage: FakeStorage,
+        embedder: FakeEmbedder,
         session_factory: async_sessionmaker,
         workspace: dict,
     ) -> None:
@@ -438,7 +443,9 @@ class TestRecoveryAndQueue:
         bad = await upload_ok(
             db_client, workspace["id"], workspace["owner"], content=make_pdf([""])
         )
-        real_queue = InProcessQueue(session_factory, lambda: storage, concurrency=1)
+        real_queue = InProcessQueue(
+            session_factory, lambda: storage, lambda: embedder, concurrency=1
+        )
 
         real_queue.enqueue(uuid.UUID(bad["id"]))
         real_queue.enqueue(uuid.UUID(good["id"]))

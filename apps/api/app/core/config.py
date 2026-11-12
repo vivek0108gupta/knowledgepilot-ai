@@ -39,6 +39,30 @@ class Settings(BaseSettings):
     # How many documents may be extracted at the same time in this process.
     processing_concurrency: int = 2
 
+    # OpenAI, for embeddings. Server-only, like the storage key.
+    openai_api_key: SecretStr = SecretStr("")
+    embedding_model: str = "text-embedding-3-small"
+    # Must equal the size of the `document_chunks.embedding` column (1536).
+    embedding_dimensions: int = 1536
+    # Chunks sent per embedding request, and how hard to try when a request fails.
+    embedding_batch_size: int = 64
+    embedding_max_attempts: int = 5
+    embedding_timeout_seconds: float = 30.0
+
+    # The chat model answers will be generated with. An identifier only: nothing calls it
+    # yet, and no code names a model directly, so changing models is a setting change.
+    openai_chat_model: str = "gpt-4.1-mini"
+
+    # Chunking, measured in tokens of the embedding model.
+    chunk_size_tokens: int = 800
+    chunk_overlap_tokens: int = 100
+
+    # Semantic search limits.
+    search_max_top_k: int = 20
+    # Results less similar than this are left out, so an unrelated query returns nothing
+    # instead of the least-bad passages. 0 disables the cut-off.
+    search_min_similarity: float = 0.2
+
     @property
     def jwt_issuer(self) -> str:
         if self.supabase_issuer:

@@ -14,6 +14,11 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
+# The tokenizer's vocabulary is downloaded on first use. Fetch it now, into the image, so
+# the running API never depends on that download and starts chunking immediately.
+ENV TIKTOKEN_CACHE_DIR=/app/.tiktoken
+RUN /app/.venv/bin/python -c "import tiktoken; tiktoken.get_encoding('cl100k_base')"
+
 COPY alembic.ini ./
 COPY alembic ./alembic
 COPY app ./app

@@ -83,6 +83,18 @@ class SupabaseStorage:
             logger.error("Storage request failed: %s %s", method, type(error).__name__)
             raise StorageError() from error
 
+    @staticmethod
+    def _status(response: httpx.Response) -> int:
+        """The real outcome of a Storage call.
+
+        Supabase Storage answers most failures with HTTP 400 and puts the meaningful status
+        (403 for a rejected key, 404 for a missing bucket) in the JSON body.
+        """
+        try:
+            return int(response.json().get("statusCode", response.status_code))
+        except (ValueError, TypeError, AttributeError):
+            return response.status_code
+
     def _fail(self, action: str, response: httpx.Response) -> StorageError:
         logger.error("Storage %s failed with status %d", action, response.status_code)
         return StorageError()
@@ -95,7 +107,15 @@ class SupabaseStorage:
             if self._bucket_verified:
                 return
             response = await self._request("GET", f"{self._storage_url}/bucket/{self._bucket}")
-            if response.status_code in (400, 404):
+            status = self._status(response)
+            if status in (401, 403):
+                logger.error("Storage rejected the configured key (status %d)", status)
+                raise AppError(
+                    503,
+                    "storage_credentials_invalid",
+                    "Document storage rejected the server's credentials.",
+                )
+            if status == 404:
                 logger.error("Storage bucket %r does not exist", self._bucket)
                 raise AppError(
                     503,
@@ -131,6 +151,7 @@ class SupabaseStorage:
             raise self._fail("upload", response)
 
     async def download_to(self, path: str, destination: BinaryIO) -> None:
+        await self._ensure_private_bucket()
         try:
             async with self._client.stream("GET", self._object_url(path)) as response:
                 if response.status_code != 200:
@@ -145,6 +166,10 @@ class SupabaseStorage:
         """Delete objects. Paths that are already gone are not an error."""
         if not paths:
             return
+        # Storage answers "deleted nothing" with success even for a bucket that does not
+        # exist. Without this check a wrong bucket name would let the caller drop its
+        # database record while the real file stayed behind.
+        await self._ensure_private_bucket()
         response = await self._request(
             "DELETE", f"{self._storage_url}/object/{self._bucket}", json={"prefixes": paths}
         )
@@ -152,6 +177,7 @@ class SupabaseStorage:
             raise self._fail("delete", response)
 
     async def create_signed_url(self, path: str, expires_in: int, download_name: str) -> str:
+        await self._ensure_private_bucket()
         response = await self._request(
             "POST",
             f"{self._storage_url}/object/sign/{self._bucket}/{encode_path(path)}",

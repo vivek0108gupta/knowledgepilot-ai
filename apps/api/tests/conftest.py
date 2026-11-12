@@ -19,6 +19,12 @@ os.environ["SUPABASE_URL"] = "https://test-project.supabase.co"
 os.environ["SUPABASE_JWKS_URL"] = ""
 os.environ["SUPABASE_ISSUER"] = ""
 os.environ["SUPABASE_JWT_AUDIENCE"] = "authenticated"
+os.environ["OPENAI_API_KEY"] = ""
+os.environ["OPENAI_CHAT_MODEL"] = "gpt-4.1-mini"
+os.environ["SEARCH_MIN_SIMILARITY"] = "0.2"
+os.environ["SEARCH_MAX_TOP_K"] = "20"
+os.environ["CHUNK_SIZE_TOKENS"] = "800"
+os.environ["CHUNK_OVERLAP_TOKENS"] = "100"
 
 import asyncpg  # noqa: E402
 from alembic import command  # noqa: E402
@@ -30,11 +36,12 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async
 from sqlalchemy.pool import NullPool  # noqa: E402
 
 from app.api.v1.documents import get_storage_provider  # noqa: E402
+from app.api.v1.search import get_embedder_provider  # noqa: E402
 from app.core.db import get_session  # noqa: E402
 from app.main import app  # noqa: E402
 from app.services.processing import get_processing_queue, process_document  # noqa: E402
 from tests.auth import JWKS  # noqa: E402
-from tests.fakes import FakeStorage, RecordingQueue  # noqa: E402
+from tests.fakes import FakeEmbedder, FakeStorage, RecordingQueue  # noqa: E402
 
 API_ROOT = Path(__file__).resolve().parent.parent
 
@@ -90,15 +97,38 @@ def database() -> None:
     command.upgrade(Config(str(API_ROOT / "alembic.ini")), "head")
 
 
+# A database connection that is accepted but never completes (seen with Docker's port
+# forwarding) would otherwise make every test wait a minute per connection, which looks like
+# a hang. Fail each attempt quickly instead, and stop the whole run on the first one.
+DB_CONNECT_TIMEOUT_SECONDS = 10
+DB_COMMAND_TIMEOUT_SECONDS = 60
+
+
 @pytest.fixture
 async def db_engine(database: None) -> AsyncIterator[AsyncEngine]:
     """A real Postgres engine with empty tables.
 
     NullPool opens a connection per use, so none is reused on another test's event loop.
     """
-    engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
-    async with engine.begin() as connection:
-        await connection.execute(text("TRUNCATE workspaces CASCADE"))
+    engine = create_async_engine(
+        TEST_DATABASE_URL,
+        poolclass=NullPool,
+        connect_args={
+            "timeout": DB_CONNECT_TIMEOUT_SECONDS,
+            "command_timeout": DB_COMMAND_TIMEOUT_SECONDS,
+        },
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(text("TRUNCATE workspaces CASCADE"))
+    except (TimeoutError, OSError) as error:
+        await engine.dispose()
+        url = make_url(TEST_DATABASE_URL)
+        pytest.exit(
+            f"The test database at {url.host}:{url.port} stopped responding "
+            f"({type(error).__name__}). Check `docker compose ps`, then run the tests again.",
+            returncode=3,
+        )
     yield engine
     await engine.dispose()
 
@@ -107,6 +137,12 @@ async def db_engine(database: None) -> AsyncIterator[AsyncEngine]:
 def storage() -> FakeStorage:
     """An in-memory stand-in for the private storage bucket."""
     return FakeStorage()
+
+
+@pytest.fixture
+def embedder() -> FakeEmbedder:
+    """A deterministic stand-in for the OpenAI embedding API."""
+    return FakeEmbedder()
 
 
 @pytest.fixture
@@ -121,18 +157,23 @@ def session_factory(db_engine: AsyncEngine) -> async_sessionmaker:
 
 
 @pytest.fixture
-def process(session_factory: async_sessionmaker, storage: FakeStorage):  # noqa: ANN201
+def process(session_factory: async_sessionmaker, storage: FakeStorage, embedder: FakeEmbedder):  # noqa: ANN201
     """Run the real processing pipeline for one document, against the test database."""
 
     async def run(document_id: str | uuid.UUID) -> None:
-        await process_document(uuid.UUID(str(document_id)), session_factory, lambda: storage)
+        await process_document(
+            uuid.UUID(str(document_id)), session_factory, lambda: storage, lambda: embedder
+        )
 
     return run
 
 
 @pytest.fixture
 async def db_client(
-    session_factory: async_sessionmaker, storage: FakeStorage, queue: RecordingQueue
+    session_factory: async_sessionmaker,
+    storage: FakeStorage,
+    queue: RecordingQueue,
+    embedder: FakeEmbedder,
 ) -> AsyncIterator[AsyncClient]:
     """An HTTP client whose requests run against the real test database.
 
@@ -146,6 +187,7 @@ async def db_client(
     app.dependency_overrides[get_session] = real_session
     app.dependency_overrides[get_storage_provider] = lambda: lambda: storage
     app.dependency_overrides[get_processing_queue] = lambda: queue
+    app.dependency_overrides[get_embedder_provider] = lambda: lambda: embedder
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as http:
         yield http

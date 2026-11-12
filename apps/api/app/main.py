@@ -21,7 +21,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     from app.services.processing import get_processing_queue, recover_interrupted
 
     try:
-        recovered = await recover_interrupted(SessionLocal, get_processing_queue())
+        # Documents processed before semantic search existed have no chunks. Index them
+        # now, but only if embeddings are configured: otherwise they would just fail.
+        can_embed = bool(get_settings().openai_api_key.get_secret_value())
+        recovered = await recover_interrupted(
+            SessionLocal, get_processing_queue(), reindex_unchunked=can_embed
+        )
         if recovered:
             logger.info("Re-queued %d document(s) left unprocessed", recovered)
     except Exception:
