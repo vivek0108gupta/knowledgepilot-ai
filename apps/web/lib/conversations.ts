@@ -128,9 +128,13 @@ const SAVED_QUESTION_CODES = new Set([
   "ai_misconfigured",
   "ai_rejected",
   "ai_invalid_response",
+  "ai_answer_too_long",
   "embeddings_unavailable",
   "answer_not_saved",
   "answer_in_progress",
+  "answer_failed",
+  "answer_superseded",
+  "stream_interrupted",
 ]);
 
 /** Whether a failed question was stored and can be retried with the same ID. A lost
@@ -142,6 +146,8 @@ export function questionWasKept(error: unknown): boolean {
 /** A message for a failed question that says what the person can do. */
 export function chatErrorMessage(error: unknown): string {
   if (!(error instanceof ApiError)) return "Something went wrong. Please try again.";
+  if (error.code === "stream_interrupted")
+    return "The connection was lost before the answer was finished. Your question was kept; try again.";
   if (error.status === 0) return "Could not reach the server. Check your connection, then try again.";
   if (error.status === 401) return "Your session has expired. Sign in again to continue.";
   if (error.status === 404) return "This conversation no longer exists, or it is not one of yours.";

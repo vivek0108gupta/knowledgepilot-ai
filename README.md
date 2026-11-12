@@ -355,7 +355,7 @@ Open a workspace and choose **Open chat**, or go to `/dashboard/workspaces/{work
 
 ## Answering questions
 
-`POST /api/v1/conversations/{conversation_id}/chat` stores a question, answers it from the documents of the conversation's workspace, and stores the answer.
+`POST /api/v1/conversations/{conversation_id}/chat` stores a question, answers it from the documents of the conversation's workspace, and stores the answer. `POST …/chat/stream` does the same through the same pipeline and sends the answer as it is written, as Server-Sent Events (see [Streaming answers](#streaming-answers)); the web app uses it.
 
 ### How an answer is made
 
@@ -369,6 +369,8 @@ question -> check the caller owns the conversation -> take the conversation's le
 | Step | Module | Responsibility |
 |---|---|---|
 | Orchestration | `app/services/chat.py` | Order of steps, transactions, the lease, error mapping. Nothing else. |
+| Streaming | `app/services/chat_stream.py` | The same steps, passing the model's text on as it is written. |
+| Provisional text | `app/services/provisional.py` | Reading the answer out of the streamed JSON; what may be shown before it is checked. |
 | History | `app/services/chat_history.py` | Which earlier turns the model sees. |
 | Query embedding | `app/services/embeddings.py` | The existing embedding service, unchanged. |
 | Retrieval | `app/services/search.py` (`nearest`) | The existing pgvector query, shared with search. |
@@ -419,7 +421,9 @@ Only `message` is required (1 to 8,000 characters). `document_ids` (up to 50) re
 
 ### Retrieval and context
 
-- **Retrieval.** The question is embedded with the existing model (`text-embedding-3-small`) and the nearest passages are found by cosine similarity, `CHAT_TOP_K` of them (default 5). A passage less similar than `CHAT_MIN_SIMILARITY` (default **0.2**) is not used. That threshold is an estimate: on one real document, relevant questions scored 0.30 to 0.54 and an unrelated one 0.10, so 0.2 separates them, but it has not been tuned on a broader set. Every stored answer records the similarity scores (never the text) so it can be tuned.
+- **Retrieval.** The question is embedded with the existing model (`text-embedding-3-small`) and the nearest passages are found by cosine similarity, `CHAT_TOP_K` of them (default 5). A passage less similar than `CHAT_MIN_SIMILARITY` (default **0.2**) is not used. Every stored answer records the similarity scores (never the text) so it can be tuned.
+- **How 0.2 was checked.** With real embeddings, 15 on-topic and 18 off-topic questions were scored against two small corpora (a 3-chunk PDF and a 4-passage policy text). On-topic questions scored 0.24 to 0.73; off-topic ones 0.03 to 0.22 (the highest was "thanks"). At 0.2 every on-topic question was kept and 1 of 18 off-topic ones passed; at 0.25 none passed but one on-topic question was lost. The sample is small, so 0.2 stays, favouring recall: the model and the citation checks still turn an unsupported question into the standard reply.
+- **Why off-topic follow-ups get through.** For a follow-up, the question is also searched together with the previous exchange (below). That raises unrelated questions too: "What is the capital of France?" scored 0.03 alone and 0.68 with the previous exchange, while a real follow-up, "Explain that in more detail", scored 0.14 alone and 0.83 with it. No threshold separates those, so off-topic questions asked after an exchange reach the model, which answers with the standard reply. That costs a model call, not a wrong answer.
 - **Follow-ups.** For a follow-up such as "explain the second point", the question is searched twice in one embedding request: alone, and together with the end of the previous exchange. The best passages of either are used. Fresh evidence is retrieved for every question.
 - **Context.** Passages are added most similar first until `CHAT_CONTEXT_TOKENS` (6,000) is used. A passage that does not fit is skipped, never cut, and its document name and location are always kept whole. No document may take more than `CHAT_MAX_CHUNKS_PER_DOCUMENT` (3) places while passages from other documents are waiting; any budget left is then filled from the passages held back, so a workspace with a single document still gets all its relevant passages.
 - **No evidence, no model call.** If no passage reaches the threshold (an empty workspace, nothing relevant, only failed or unprocessed documents), the model is not called and the answer is: "I couldn't find sufficient information in your uploaded documents to answer that question."
@@ -430,9 +434,10 @@ The model is given each passage with a short id (`S1`, `S2`…) and must answer 
 
 - every id is looked up in that request's own passages; an id that was not supplied is removed from the text and from the list;
 - every citation is built from the stored chunk (its real document ID, name, chunk ID and page, paragraph or line references), never from anything the model wrote;
-- the model's quote is shown only if it really appears in the passage; otherwise the start of the passage is shown;
+- the model's quote only says where to look: the excerpt is always the document's own text at that place. The quote is found ignoring case, punctuation, dashes, quote marks, ligatures, `...` and words hyphenated across lines; failing that, from its longest run of at least 6 consecutive words in the passage. A quote that cannot be found is ignored and the start of the passage is shown. Stored answers count `unverified_quotes` and `approximate_quotes`;
 - an answer left with no valid citation is treated as unsupported and replaced with the standard "couldn't find" reply;
-- markers are renumbered `[1]`, `[2]`… in order of first use, matching the citation numbers.
+- markers are renumbered `[1]`, `[2]`… in order of first use, matching the citation numbers;
+- **every citation has a marker and every marker has a citation.** A source the model listed but never marked is not shown when the text marks others (`unmarked_citations` counts them). If the text marks none, its listed sources are marked at the end of the answer.
 
 In the web app each marker is a button that opens its source card, which shows the document name, the page, paragraph or line range, the excerpt, and a download link.
 
@@ -454,6 +459,7 @@ Up to `CHAT_HISTORY_MESSAGES` (10) earlier messages, within `CHAT_HISTORY_TOKENS
 - **Per-conversation lease.** While an answer is being written, the conversation records which question it is for and since when (`generating_message_id`, `generating_since`, migration `0006`). A second question in the same conversation gets `409 conversation_busy` and is not stored. The lease is taken and released in short transactions, so no database lock or connection is held while OpenAI works, and it expires after `CHAT_GENERATION_LEASE_SECONDS` (300), so a crash cannot block a conversation.
 - **Idempotency.** Send a `client_message_id` and reuse it to retry. If that question already has an answer, the stored question and answer come back with `200` and the model is not called again. If its answer failed, the stored question is answered again; it is never stored twice. The same ID sent twice at once gets `409 answer_in_progress` for the second request.
 - **Failures keep the question and invent nothing.** If retrieval, the model or saving fails, the question stays stored, no assistant message is created, and the lease is released. The web app then offers **Try again**, which reuses the same ID.
+- **Streaming shares all of this.** `/chat` and `/chat/stream` take the same lease, so a conversation answers one question at a time whichever is used, and each replays the other's stored answers.
 
 | Code | Status | Meaning | Question kept |
 |---|---|---|---|
@@ -463,11 +469,62 @@ Up to `CHAT_HISTORY_MESSAGES` (10) earlier messages, within `CHAT_HISTORY_TOKENS
 | `ai_unavailable` | 503 | Rate limited, timed out or an OpenAI server error, after retries. | Yes |
 | `ai_misconfigured` | 503 | OpenAI rejected the key, permissions or model name. | Yes |
 | `ai_rejected` | 502 | OpenAI refused this request. | Yes |
-| `ai_invalid_response` | 502 | The output did not match the schema or was cut off. | Yes |
+| `ai_invalid_response` | 502 | The output did not match the schema. | Yes |
+| `ai_answer_too_long` | 502 | The answer reached `CHAT_MAX_OUTPUT_TOKENS` before it was finished. Ask for less at once. | Yes |
 | `embeddings_unavailable` | 503 | The question could not be embedded. | Yes |
 | `answer_not_saved` | 500 | The answer could not be stored. | Yes |
+| `answer_superseded` | 409 | The answer took longer than the lease and another took over. | Yes |
+| `answer_failed` | 500 | Streaming only: an unexpected error while answering. | Yes |
 
 Rate limits, timeouts, connection errors and 5xx responses are retried up to `CHAT_MAX_ATTEMPTS` (3) with exponential backoff and jitter, honouring `Retry-After`; each request has a `CHAT_TIMEOUT_SECONDS` (45) timeout. Authentication, permission, model-not-found and other 4xx errors are not retried. The SDK's own retries are off, so attempts are bounded and logged in one place.
+
+### Streaming answers
+
+`POST /api/v1/conversations/{conversation_id}/chat/stream` takes the same body as `/chat` and applies the same checks. Anything that stops answering from starting (sign-in, access, an archived conversation, a busy conversation, a reused message ID, no `OPENAI_API_KEY`, invalid input) is an ordinary JSON error, as above. Once started, the response is `200 text/event-stream`:
+
+```
+id: 1
+event: message_started
+data: {"conversation_id":"…","user_message":{…},"assistant_message_id":"…","replayed":false}
+
+id: 2
+event: text_delta
+data: {"text":"Customers can request a full refund within 30 days of purchase"}
+
+id: 3
+event: text_delta
+data: {"text":", provided the item is unused."}
+
+id: 4
+event: citations
+data: {"citations":[{"number":1,"document_name":"policy.pdf","page_number":4,"excerpt":"…","…":"…"}]}
+
+id: 5
+event: message_completed
+data: {"assistant_message":{…},"model":"gpt-4.1-mini-2025-04-14","input_tokens":967,"output_tokens":183,"replayed":false}
+```
+
+| Event | Data | Meaning |
+|---|---|---|
+| `message_started` | `conversation_id`, `user_message`, `assistant_message_id`, `replayed` | The question is stored; the answer will be stored under `assistant_message_id`. |
+| `text_delta` (0 or more) | `text` | Provisional answer text, to append to what is shown. Not yet checked, and without source markers. |
+| `citations` | `citations` | The checked citations of the final answer. |
+| `message_completed` | `assistant_message`, `model`, `input_tokens`, `output_tokens`, `replayed` | The checked, stored answer. It **replaces** the provisional text; its `[n]` markers match the citations. |
+| `error` | `code`, `message`, `status`, `question_saved` | Answering failed. No answer was stored and the conversation is free. Codes and statuses are those in the table above. |
+
+Every event has an increasing `id`. A stream ends after `message_completed` or `error`. Clients should ignore events they do not know, so the protocol can grow. Streams cannot be resumed from an `id`: retrying with the same `client_message_id` returns the stored answer (`replayed: true`, no `text_delta`) or answers the stored question again.
+
+**Provisional text is never the answer.** The model writes its strict JSON a few characters at a time. The server reads the `answer` field out of it as it arrives (`app/services/provisional.py`) and sends that text on, with three safeguards:
+
+- source markers (`[S1]`) are left out, because their numbers are only known once the citations are checked, and an invented one must never be shown;
+- the latest 96 characters are held back until more arrives, so text that repeats the instructions or the request's private tag name is caught before any of it is sent, and nothing more is sent after that;
+- when the output is complete, it goes through exactly the same checks as `/chat` (`citations.finalize`), and only that result is stored and sent in `message_completed`. If the checks reject it, the stored answer is the standard "couldn't find" reply; the provisional text is never stored.
+
+**Disconnects and stopping.** If the client goes away before `message_completed` (the person pressed **Stop**, closed the tab or lost the connection), the answer is abandoned. Generation stops upstream, nothing is stored, the question stays, and the lease is released at once, not after 300 seconds. This holds however the response ends, including when the connection breaks before the first event. Once storing has begun it is finished, even if the client has gone, so the answer is there on reload. A client can't disconnect without the server noticing for long: the server learns of a disconnect when it next sends an event, and once writing starts, text is sent every few hundredths of a second.
+
+**OpenAI streaming.** The same request as `/chat` with `stream: true`, through the one shared client. A failure before any text arrives is retried like `/chat`. Once text has been sent, a failure ends the stream with an `error`, since the client has already shown part of the answer. Each wait for the next event is bounded by `CHAT_TIMEOUT_SECONDS` (45), and the whole stream by `CHAT_STREAM_TIMEOUT_SECONDS` (120), which is below the 300-second lease. Errors reported inside the stream (`response.failed`, `error`) are mapped to the same codes. Only event types and error codes are logged, never text.
+
+**In the web app,** answers are always streamed. The browser's `EventSource` cannot send a POST body or an `Authorization` header, so the stream is read with `fetch` (`apps/web/lib/chat-stream.ts`), using the session's token like every other request; nothing is stored in `localStorage`. While an answer is written, the app shows a typing indicator, then the text as it arrives, with a note that sources are checked when it finishes. Send is disabled and a **Stop** button appears. On completion the provisional text is replaced by the checked answer and its source cards. After **Stop** or a broken connection, the question is kept and **Try again** answers it with the same ID.
 
 ### OpenAI configuration
 
@@ -475,10 +532,13 @@ Rate limits, timeouts, connection errors and 5xx responses are retried up to `CH
 
 ### Limitations of answering
 
-- **No streaming.** The answer arrives whole, after a few seconds. Streaming is a later milestone.
+- **Streams cannot be resumed.** A broken connection abandons the answer; Try again answers it afresh. Moving to another conversation in the app does not stop the request, but closing or reloading the tab does.
+- **Provisional text lags by up to 96 characters,** so very short answers appear only when they are finished, and the provisional text can differ from the final answer (markers added, or replaced by the standard reply).
+- **The first sentence of the instructions could appear provisionally** if the model started reciting them, before the leak check stops the stream: it says only that the assistant answers from the user's documents. The stored answer is then the standard reply.
+- **Long answers can hit `CHAT_MAX_OUTPUT_TOKENS` (1,000).** They are reported as `ai_answer_too_long`, not stored, and are best asked in smaller parts.
 - **One answer at a time per conversation.** Questions in other conversations are answered in parallel.
 - **A question that was never answered stays without an answer** until it is retried.
-- **The similarity threshold is not tuned** beyond one document (see above).
+- **The similarity threshold is checked on a small sample only** (see above), and off-topic follow-ups still cost a model call.
 - **Every answer must cite.** A reply such as "thanks" gets the standard "couldn't find" reply, because there is nothing to cite.
 - **Vector search only,** as for search: exact codes or names can rank below loosely related text.
 - **The excerpt is short,** a quote or the start of the passage, not the whole passage.

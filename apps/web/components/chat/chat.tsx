@@ -18,8 +18,8 @@ import { TextField } from "@/components/ui/field";
 import { Modal } from "@/components/ui/modal";
 import { ApiError, errorMessage } from "@/lib/api";
 import { cn } from "@/lib/cn";
+import { streamQuestion, wasStopped } from "@/lib/chat-stream";
 import {
-  askQuestion,
   chatErrorMessage,
   chatPath,
   conversationKeys,
@@ -495,6 +495,40 @@ function AssistantBubble({ message }: { message: Message }) {
   );
 }
 
+/**
+ * The answer while it is being written. Its text is provisional: it has no source markers, and
+ * is replaced by the checked answer, with its sources, when writing finishes.
+ */
+function StreamingBubble({ text }: { text: string }) {
+  return (
+    <li className="flex flex-col items-start gap-1" aria-busy="true">
+      <span className="sr-only">Assistant is writing:</span>
+      <div className="max-w-[85%] rounded-2xl rounded-bl-md border border-zinc-200 bg-white px-4 py-2 text-sm leading-6 text-zinc-900">
+        {text ? (
+          <p className="break-words whitespace-pre-wrap">
+            {text}
+            <span
+              aria-hidden="true"
+              className="ml-0.5 inline-block h-4 w-1.5 animate-pulse bg-zinc-400 align-text-bottom"
+            />
+          </p>
+        ) : (
+          <span aria-hidden="true" data-testid="typing-indicator" className="flex h-6 items-center gap-1">
+            {[0, 150, 300].map((delay) => (
+              <span
+                key={delay}
+                className="size-1.5 animate-bounce rounded-full bg-zinc-400"
+                style={{ animationDelay: `${delay}ms` }}
+              />
+            ))}
+          </span>
+        )}
+      </div>
+      <span className="px-1 text-xs text-zinc-500">Sources are checked when the answer is finished.</span>
+    </li>
+  );
+}
+
 function MessageBubble({ message }: { message: Message }) {
   return message.role === "user" ? (
     <UserBubble content={message.content} createdAt={message.created_at} />
@@ -518,9 +552,19 @@ interface ComposerProps {
   failure: Failure | null;
   onSend: () => void;
   onRetry: () => void;
+  onStop: () => void;
 }
 
-function Composer({ conversation, draft, onDraftChange, sending, failure, onSend, onRetry }: ComposerProps) {
+function Composer({
+  conversation,
+  draft,
+  onDraftChange,
+  sending,
+  failure,
+  onSend,
+  onRetry,
+  onStop,
+}: ComposerProps) {
   const inputId = useId();
   const [draftError, setDraftError] = useState<string | null>(null);
 
@@ -587,9 +631,16 @@ function Composer({ conversation, draft, onDraftChange, sending, failure, onSend
           aria-describedby={`${inputId}-hint${draftError ? ` ${inputId}-error` : ""}`}
           className="max-h-48 min-h-[2.75rem] flex-1 resize-y rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-900 placeholder:text-zinc-400 focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-zinc-900 disabled:cursor-not-allowed disabled:bg-zinc-50"
         />
-        <Button type="submit" loading={sending} disabled={archived}>
-          {sending ? "Answering…" : "Send"}
-        </Button>
+        <div className="flex shrink-0 flex-col gap-1 sm:flex-row">
+          {sending && (
+            <Button variant="secondary" onClick={onStop}>
+              Stop
+            </Button>
+          )}
+          <Button type="submit" loading={sending} disabled={archived}>
+            {sending ? "Answering…" : "Send"}
+          </Button>
+        </div>
       </div>
       <p id={`${inputId}-hint`} className="mt-2 text-xs text-zinc-500">
         Enter to send, Shift+Enter for a new line. Answers come only from this workspace&apos;s documents.
@@ -604,6 +655,10 @@ function ChatArea({ workspaceId, conversationId }: { workspaceId: string; conver
   const [draft, setDraft] = useState("");
   const [pending, setPending] = useState<{ content: string; id: string } | null>(null);
   const [failure, setFailure] = useState<Failure | null>(null);
+  // The answer as it is being written, and whether the server has started on it.
+  const [streamed, setStreamed] = useState("");
+  const [started, setStarted] = useState<Message | null>(null);
+  const controller = useRef<AbortController | null>(null);
 
   const conversation = useQuery({
     queryKey: conversationKeys.detail(workspaceId, conversationId),
@@ -636,11 +691,30 @@ function ChatArea({ workspaceId, conversationId }: { workspaceId: string; conver
     ]);
 
   const ask = useMutation({
-    mutationFn: (question: { content: string; id: string }) =>
-      askQuestion(conversationId, question.content, question.id),
+    mutationFn: (question: { content: string; id: string }) => {
+      const abort = new AbortController();
+      controller.current = abort;
+      return streamQuestion(
+        conversationId,
+        question.content,
+        question.id,
+        {
+          onStarted: (event) => setStarted(event.user_message),
+          onDelta: (text) => setStreamed((current) => current + text),
+        },
+        abort.signal,
+      );
+    },
     onMutate: (question) => {
       setFailure(null);
       setPending(question);
+      setStreamed("");
+      setStarted(null);
+    },
+    onSettled: () => {
+      controller.current = null;
+      setStreamed("");
+      setStarted(null);
     },
     onSuccess: (result) => {
       // Show the stored question and answer at once, then refresh in the background.
@@ -661,6 +735,15 @@ function ChatArea({ workspaceId, conversationId }: { workspaceId: string; conver
       void refreshConversation();
     },
     onError: (error, question) => {
+      if (wasStopped(error)) {
+        // Stopping abandons the answer. The question is kept (or was never stored), and
+        // trying again with the same ID answers it without storing it twice.
+        setFailure({ message: "You stopped this answer. Your question was kept.", ...question, kept: true });
+        setPending(null);
+        void queryClient.invalidateQueries({ queryKey: messagesKey });
+        void refreshConversation();
+        return;
+      }
       const kept = questionWasKept(error);
       setFailure({ message: chatErrorMessage(error), ...question, kept });
       setPending(null);
@@ -684,12 +767,16 @@ function ChatArea({ workspaceId, conversationId }: { workspaceId: string; conver
     if (failure) ask.mutate({ content: failure.content, id: failure.id });
   }
 
+  function stop() {
+    controller.current?.abort();
+  }
+
   const ordered = messages.data ? [...messages.data.pages].reverse().flatMap((page) => page.items) : [];
   const newest = ordered.at(-1)?.id;
 
   useEffect(() => {
     endRef.current?.scrollIntoView?.({ block: "end" });
-  }, [newest, pending]);
+  }, [newest, pending, streamed]);
 
   const backLink = (
     <Link href={chatPath(workspaceId)} className={cn(buttonClass("ghost", "sm"), "md:hidden")}>
@@ -781,12 +868,15 @@ function ChatArea({ workspaceId, conversationId }: { workspaceId: string; conver
               {ordered.map((message) => (
                 <MessageBubble key={message.id} message={message} />
               ))}
-              {pending && <UserBubble content={pending.content} sending />}
+              {pending && (
+                <UserBubble content={pending.content} createdAt={started?.created_at} sending={!started} />
+              )}
+              {pending && <StreamingBubble text={streamed} />}
             </ol>
             {pending && (
               <div role="status" className="mt-3 flex items-center gap-2 text-sm text-zinc-500">
                 <span aria-hidden="true" className="size-2 animate-pulse rounded-full bg-zinc-400" />
-                Searching your documents and writing an answer…
+                {streamed ? "Writing an answer…" : "Searching your documents and writing an answer…"}
               </div>
             )}
           </>
@@ -802,6 +892,7 @@ function ChatArea({ workspaceId, conversationId }: { workspaceId: string; conver
         failure={failure}
         onSend={send}
         onRetry={retry}
+        onStop={stop}
       />
     </section>
   );

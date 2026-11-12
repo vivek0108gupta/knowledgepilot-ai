@@ -1,9 +1,10 @@
 import { QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, screen, within } from "@testing-library/react";
+import { act, fireEvent, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 
 import { ApiError } from "@/lib/api";
+import type { StreamHandlers } from "@/lib/chat-stream";
 import type { Citation, Conversation, Message, MessagePage } from "@/lib/conversations";
 import { renderWithQuery } from "@/test/render";
 
@@ -25,7 +26,7 @@ const mocks = vi.hoisted(() => ({
   renameConversation: vi.fn(),
   deleteConversation: vi.fn(),
   listMessages: vi.fn(),
-  askQuestion: vi.fn(),
+  streamQuestion: vi.fn(),
   getDownload: vi.fn(),
   startDownload: vi.fn(),
 }));
@@ -54,7 +55,11 @@ vi.mock("@/lib/conversations", async (importOriginal) => ({
   renameConversation: mocks.renameConversation,
   deleteConversation: mocks.deleteConversation,
   listMessages: mocks.listMessages,
-  askQuestion: mocks.askQuestion,
+}));
+
+vi.mock("@/lib/chat-stream", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/chat-stream")>()),
+  streamQuestion: mocks.streamQuestion,
 }));
 
 function conversation(id: string, title: string, workspaceId = WORKSPACE): Conversation {
@@ -341,7 +346,7 @@ function chatResult(question: string, reply: Message, sequence = 1) {
 
 describe("asking a question", () => {
   test("sends the question with an idempotency ID, then shows the stored question and answer", async () => {
-    mocks.askQuestion.mockResolvedValue(
+    mocks.streamQuestion.mockResolvedValue(
       chatResult("What is the refund policy?", answer(2, "Refunds within 30 days [1].", [citation(1)])),
     );
     open(FIRST);
@@ -353,7 +358,7 @@ describe("asking a question", () => {
     const list = await screen.findByRole("list", { name: "Messages" });
     expect(await within(list).findByText("What is the refund policy?")).toBeInTheDocument();
     expect(within(list).getByText(/Refunds within 30 days/)).toBeInTheDocument();
-    const [conversationId, content, clientId] = mocks.askQuestion.mock.calls[0]!;
+    const [conversationId, content, clientId] = mocks.streamQuestion.mock.calls[0]!;
     expect([conversationId, content]).toEqual([FIRST, "What is the refund policy?"]);
     expect(clientId).toMatch(/^[0-9a-f-]{36}$/);
     expect(composer()).toHaveValue("");
@@ -361,7 +366,7 @@ describe("asking a question", () => {
 
   test("shows the question and a progress message while the answer is written", async () => {
     let finish: (value: unknown) => void = () => {};
-    mocks.askQuestion.mockReturnValue(new Promise((resolve) => (finish = resolve)));
+    mocks.streamQuestion.mockReturnValue(new Promise((resolve) => (finish = resolve)));
     open(FIRST);
     const user = userEvent.setup();
     const box = await screen.findByRole("textbox", { name: "Message" });
@@ -375,7 +380,7 @@ describe("asking a question", () => {
     expect(sending).toHaveAttribute("aria-busy", "true");
     expect(box).toBeDisabled();
     fireEvent.keyDown(box, { key: "Enter" });
-    expect(mocks.askQuestion).toHaveBeenCalledTimes(1);
+    expect(mocks.streamQuestion).toHaveBeenCalledTimes(1);
 
     finish(chatResult("What is the refund policy?", answer(2, "Refunds within 30 days [1].", [citation(1)])));
 
@@ -385,7 +390,7 @@ describe("asking a question", () => {
   });
 
   test("Enter sends and Shift+Enter makes a new line", async () => {
-    mocks.askQuestion.mockResolvedValue(
+    mocks.streamQuestion.mockResolvedValue(
       chatResult("line one\nline two", answer(2, "ok [1].", [citation(1)])),
     );
     open(FIRST);
@@ -394,12 +399,12 @@ describe("asking a question", () => {
 
     await user.type(box, "line one{Shift>}{Enter}{/Shift}line two");
     expect(box).toHaveValue("line one\nline two");
-    expect(mocks.askQuestion).not.toHaveBeenCalled();
+    expect(mocks.streamQuestion).not.toHaveBeenCalled();
 
     await user.type(box, "{Enter}");
 
-    await vi.waitFor(() => expect(mocks.askQuestion).toHaveBeenCalledTimes(1));
-    expect(mocks.askQuestion.mock.calls[0]![1]).toBe("line one\nline two");
+    await vi.waitFor(() => expect(mocks.streamQuestion).toHaveBeenCalledTimes(1));
+    expect(mocks.streamQuestion.mock.calls[0]![1]).toBe("line one\nline two");
   });
 
   test("Enter does not send while an input method is still composing", async () => {
@@ -409,7 +414,7 @@ describe("asking a question", () => {
 
     fireEvent.keyDown(box, { key: "Enter", isComposing: true });
 
-    expect(mocks.askQuestion).not.toHaveBeenCalled();
+    expect(mocks.streamQuestion).not.toHaveBeenCalled();
   });
 
   test.each(["", "   ", "\n\n"])("an empty or blank question %j is not sent", async (draft) => {
@@ -422,7 +427,7 @@ describe("asking a question", () => {
 
     expect(screen.getByRole("alert")).toHaveTextContent("Write a message first.");
     expect(box).toBeInvalid();
-    expect(mocks.askQuestion).not.toHaveBeenCalled();
+    expect(mocks.streamQuestion).not.toHaveBeenCalled();
   });
 
   test("the box cannot hold more than the API accepts", async () => {
@@ -432,7 +437,7 @@ describe("asking a question", () => {
   });
 
   test("a follow-up is sent in the same conversation after the first answer", async () => {
-    mocks.askQuestion
+    mocks.streamQuestion
       .mockResolvedValueOnce(
         chatResult(
           "List the policies.",
@@ -451,11 +456,11 @@ describe("asking a question", () => {
     await user.type(box, "Explain the second point.{Enter}");
 
     expect(await screen.findByText(/Shipping takes two days/)).toBeInTheDocument();
-    expect(mocks.askQuestion.mock.calls.map((call) => call.slice(0, 2))).toEqual([
+    expect(mocks.streamQuestion.mock.calls.map((call) => call.slice(0, 2))).toEqual([
       [FIRST, "List the policies."],
       [FIRST, "Explain the second point."],
     ]);
-    expect(mocks.askQuestion.mock.calls[0]![2]).not.toBe(mocks.askQuestion.mock.calls[1]![2]);
+    expect(mocks.streamQuestion.mock.calls[0]![2]).not.toBe(mocks.streamQuestion.mock.calls[1]![2]);
   });
 
   test("the answer survives a refresh, because it comes from the stored history", async () => {
@@ -480,7 +485,7 @@ describe("asking a question", () => {
     mocks.getConversation
       .mockResolvedValueOnce(conversation(FIRST, "New conversation"))
       .mockResolvedValue(conversation(FIRST, "What is the refund policy?"));
-    mocks.askQuestion.mockResolvedValue(
+    mocks.streamQuestion.mockResolvedValue(
       chatResult("What is the refund policy?", answer(2, "ok [1].", [citation(1)])),
     );
     open(FIRST);
@@ -509,7 +514,7 @@ describe("asking a question", () => {
 
 describe("when answering fails", () => {
   test("a stored question offers Try again, which reuses its ID so it is not stored twice", async () => {
-    mocks.askQuestion
+    mocks.streamQuestion
       .mockRejectedValueOnce(
         new ApiError(
           503,
@@ -539,7 +544,10 @@ describe("when answering fails", () => {
     await user.click(within(alert).getByRole("button", { name: "Try again" }));
 
     expect(await screen.findByText(/Here it is/)).toBeInTheDocument();
-    expect(mocks.askQuestion.mock.calls[1]!.slice(1)).toEqual(mocks.askQuestion.mock.calls[0]!.slice(1));
+    // Same text, same ID.
+    expect(mocks.streamQuestion.mock.calls[1]!.slice(1, 3)).toEqual(
+      mocks.streamQuestion.mock.calls[0]!.slice(1, 3),
+    );
   });
 
   test.each([
@@ -550,8 +558,13 @@ describe("when answering fails", () => {
       "The AI service returned an unusable answer. Your question was saved; try again.",
     ],
     ["embeddings_unavailable", 503, "Search is temporarily unavailable. Try again."],
+    [
+      "ai_answer_too_long",
+      502,
+      "The answer was too long to finish. Your question was saved; try asking for less at once.",
+    ],
   ])("%s is explained, with a retry", async (code, status, message) => {
-    mocks.askQuestion.mockRejectedValue(new ApiError(status, code, message));
+    mocks.streamQuestion.mockRejectedValue(new ApiError(status, code, message));
     open(FIRST);
 
     await userEvent.setup().type(await screen.findByRole("textbox", { name: "Message" }), "question{Enter}");
@@ -562,7 +575,7 @@ describe("when answering fails", () => {
   });
 
   test("a lost connection keeps the question retryable with the same ID", async () => {
-    mocks.askQuestion
+    mocks.streamQuestion
       .mockRejectedValueOnce(new ApiError(0, "network_error", "Could not reach the server."))
       .mockResolvedValueOnce(chatResult("question", answer(2, "ok [1].", [citation(1)])));
     open(FIRST);
@@ -573,8 +586,8 @@ describe("when answering fails", () => {
     expect(alert).toHaveTextContent("Could not reach the server.");
     await user.click(within(alert).getByRole("button", { name: "Try again" }));
 
-    await vi.waitFor(() => expect(mocks.askQuestion).toHaveBeenCalledTimes(2));
-    expect(mocks.askQuestion.mock.calls[1]![2]).toBe(mocks.askQuestion.mock.calls[0]![2]);
+    await vi.waitFor(() => expect(mocks.streamQuestion).toHaveBeenCalledTimes(2));
+    expect(mocks.streamQuestion.mock.calls[1]![2]).toBe(mocks.streamQuestion.mock.calls[0]![2]);
   });
 
   test.each([
@@ -585,7 +598,7 @@ describe("when answering fails", () => {
       "Answering questions has not been set up on the server yet.",
     ],
   ])("a question that was not stored goes back into the box", async (error, expected) => {
-    mocks.askQuestion.mockRejectedValue(error);
+    mocks.streamQuestion.mockRejectedValue(error);
     open(FIRST);
     const box = await screen.findByRole("textbox", { name: "Message" });
 
@@ -598,7 +611,7 @@ describe("when answering fails", () => {
   });
 
   test("resending the returned text reuses its ID", async () => {
-    mocks.askQuestion
+    mocks.streamQuestion
       .mockRejectedValueOnce(new ApiError(409, "conversation_busy", "x"))
       .mockResolvedValueOnce(chatResult("unsent thought", answer(2, "ok [1].", [citation(1)])));
     open(FIRST);
@@ -609,12 +622,12 @@ describe("when answering fails", () => {
     await screen.findByRole("alert");
     await user.click(screen.getByRole("button", { name: "Send" }));
 
-    await vi.waitFor(() => expect(mocks.askQuestion).toHaveBeenCalledTimes(2));
-    expect(mocks.askQuestion.mock.calls[1]![2]).toBe(mocks.askQuestion.mock.calls[0]![2]);
+    await vi.waitFor(() => expect(mocks.streamQuestion).toHaveBeenCalledTimes(2));
+    expect(mocks.streamQuestion.mock.calls[1]![2]).toBe(mocks.streamQuestion.mock.calls[0]![2]);
   });
 
   test("the server's raw text is not shown for an unexpected error", async () => {
-    mocks.askQuestion.mockRejectedValue(
+    mocks.streamQuestion.mockRejectedValue(
       new ApiError(500, "internal_error", "psycopg.OperationalError at db:5432"),
     );
     open(FIRST);
@@ -742,6 +755,192 @@ describe("answers and their sources", () => {
 
     await screen.findByRole("list", { name: "Messages" });
     expect(container.querySelector("script, img")).toBeNull();
+  });
+});
+
+/** Takes over `streamQuestion`, so a test can send each stage of the answer when it chooses. */
+function controlledStream() {
+  const state: {
+    handlers: StreamHandlers;
+    signal?: AbortSignal;
+    resolve: (value: unknown) => void;
+    reject: (error: unknown) => void;
+  } = {
+    handlers: {},
+    resolve: () => {},
+    reject: () => {},
+  };
+  mocks.streamQuestion.mockImplementation(
+    (
+      _conversation: string,
+      _message: string,
+      _id: string,
+      handlers: StreamHandlers = {},
+      signal?: AbortSignal,
+    ) =>
+      new Promise((resolve, reject) => {
+        Object.assign(state, { handlers, signal, resolve, reject });
+        signal?.addEventListener("abort", () =>
+          reject(new DOMException("The answer was stopped.", "AbortError")),
+        );
+      }),
+  );
+  return {
+    get signal() {
+      return state.signal;
+    },
+    start: (question: string) =>
+      act(() =>
+        state.handlers.onStarted?.({
+          conversation_id: FIRST,
+          user_message: message(1, question),
+          assistant_message_id: "00000000-0000-4000-8000-000000000002",
+          replayed: false,
+        }),
+      ),
+    delta: (text: string) => act(() => state.handlers.onDelta?.(text)),
+    finish: (result: unknown) => act(async () => state.resolve(result)),
+    fail: (error: unknown) => act(async () => state.reject(error)),
+  };
+}
+
+describe("streaming answers", () => {
+  const QUESTION = "What is the refund policy?";
+
+  async function ask(question = QUESTION) {
+    open(FIRST);
+    const user = userEvent.setup();
+    await user.type(await screen.findByRole("textbox", { name: "Message" }), `${question}{Enter}`);
+    return user;
+  }
+
+  test("shows a typing indicator, then the answer as it is written", async () => {
+    const stream = controlledStream();
+    await ask();
+
+    expect(await screen.findByTestId("typing-indicator")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Searching your documents and writing an answer…");
+
+    await stream.start(QUESTION);
+    await stream.delta("Customers can request ");
+    expect(screen.getByText("Customers can request")).toBeInTheDocument();
+    expect(screen.queryByTestId("typing-indicator")).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Writing an answer…");
+
+    await stream.delta("a refund within 30 days.");
+    expect(screen.getByText("Customers can request a refund within 30 days.")).toBeInTheDocument();
+    expect(screen.getByText("Assistant is writing:").closest("li")).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByText("Sources are checked when the answer is finished.")).toBeInTheDocument();
+  });
+
+  test("when it finishes, the checked answer replaces the provisional text and its sources appear", async () => {
+    const stream = controlledStream();
+    await ask();
+    await stream.start(QUESTION);
+    await stream.delta("Customers can request a refund within thirty days");
+
+    await stream.finish(
+      chatResult(QUESTION, answer(2, "Customers can request a refund within 30 days [1].", [citation(1)])),
+    );
+
+    const list = screen.getByRole("list", { name: "Messages" });
+    expect(within(list).queryByText("Assistant is writing:")).not.toBeInTheDocument();
+    expect(within(list).queryByText(/within thirty days/)).not.toBeInTheDocument();
+    // The answer itself (the excerpt in its source card says much the same).
+    expect(within(list).getByText(/within 30 days/, { selector: "p" })).toBeInTheDocument();
+    expect(within(list).getByRole("button", { name: "Show source 1" })).toBeInTheDocument();
+    expect(
+      within(within(list).getByRole("region", { name: "Sources" })).getByText("refund-policy.pdf"),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Send" })).toBeEnabled();
+  });
+
+  test("a second question cannot be sent while an answer is being written", async () => {
+    controlledStream();
+    const user = await ask();
+    const box = composer();
+
+    expect(box).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Answering…" })).toBeDisabled();
+    fireEvent.keyDown(box, { key: "Enter" });
+    await user.click(screen.getByRole("button", { name: "Answering…" }));
+
+    expect(mocks.streamQuestion).toHaveBeenCalledTimes(1);
+  });
+
+  test("Stop abandons the answer, keeps the question, and Try again answers it with the same ID", async () => {
+    const stream = controlledStream();
+    const user = await ask();
+    await stream.start(QUESTION);
+    await stream.delta("Customers can");
+
+    await user.click(screen.getByRole("button", { name: "Stop" }));
+
+    expect(stream.signal?.aborted).toBe(true);
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("You stopped this answer. Your question was kept.");
+    expect(screen.queryByText("Customers can")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Stop" })).not.toBeInTheDocument();
+
+    const again = controlledStream();
+    await user.click(within(alert).getByRole("button", { name: "Try again" }));
+    await again.finish(chatResult(QUESTION, answer(2, "Here it is [1].", [citation(1)])));
+
+    expect(await screen.findByText(/Here it is/)).toBeInTheDocument();
+    const [first, second] = mocks.streamQuestion.mock.calls;
+    expect(second!.slice(1, 3)).toEqual(first!.slice(1, 3));
+  });
+
+  test("a broken connection discards the provisional text and offers a retry", async () => {
+    const stream = controlledStream();
+    await ask();
+    await stream.start(QUESTION);
+    await stream.delta("Customers can request");
+
+    await stream.fail(new ApiError(0, "stream_interrupted", "lost"));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(
+      "The connection was lost before the answer was finished. Your question was kept",
+    );
+    expect(within(alert).getByRole("button", { name: "Try again" })).toBeInTheDocument();
+    expect(screen.queryByText("Customers can request")).not.toBeInTheDocument();
+    expect(composer()).toHaveValue("");
+  });
+
+  test("an answer that fails part way is never shown as an answer", async () => {
+    const stream = controlledStream();
+    await ask();
+    await stream.start(QUESTION);
+    await stream.delta("Partial text");
+
+    await stream.fail(
+      new ApiError(
+        503,
+        "ai_unavailable",
+        "The AI service is busy or unreachable. Your question was saved; try again shortly.",
+      ),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Your question was saved");
+    expect(screen.queryByText("Partial text")).not.toBeInTheDocument();
+    expect(screen.queryByText("Assistant said:")).not.toBeInTheDocument();
+  });
+
+  test("after a reload the stored answer is shown with its sources", async () => {
+    const stream = controlledStream();
+    await ask();
+    const stored = [message(1, QUESTION), answer(2, "Refunds within 30 days [1].", [citation(1)])];
+    await stream.finish({ conversation_id: FIRST, user_message: stored[0], assistant_message: stored[1] });
+    mocks.listMessages.mockResolvedValue(page(stored));
+
+    document.body.innerHTML = "";
+    open(FIRST);
+
+    const list = await screen.findByRole("list", { name: "Messages" });
+    expect(await within(list).findByText(/Refunds within 30 days/)).toBeInTheDocument();
+    expect(within(list).getByRole("region", { name: "Sources" })).toBeInTheDocument();
   });
 });
 
@@ -954,7 +1153,9 @@ describe("authentication failure", () => {
   });
 
   test("an expired session while sending keeps the draft and says why", async () => {
-    mocks.askQuestion.mockRejectedValue(new ApiError(401, "token_expired", "The access token has expired."));
+    mocks.streamQuestion.mockRejectedValue(
+      new ApiError(401, "token_expired", "The access token has expired."),
+    );
     open(FIRST);
     const box = await screen.findByRole("textbox", { name: "Message" });
 

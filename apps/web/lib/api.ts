@@ -51,6 +51,34 @@ export interface ApiRequest {
   signal?: AbortSignal;
 }
 
+/** Headers that identify the signed-in user to the API: the session's access token, if any. */
+export async function authHeaders(): Promise<Record<string, string>> {
+  const token = apiAuth ? await apiAuth.getAccessToken() : null;
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+/** The `ApiError` for a failed response. Ends the session when the API rejected the token. */
+export async function apiErrorFrom(response: Response): Promise<ApiError> {
+  const body: unknown = await response.json().catch(() => null);
+  return errorFor(response, body);
+}
+
+function errorFor(response: Response, body: unknown): ApiError {
+  const requestId = response.headers.get("X-Request-ID") ?? undefined;
+  if (response.status === 401) apiAuth?.onUnauthorized();
+  const envelope = errorEnvelopeSchema.safeParse(body);
+  if (envelope.success) {
+    const { code, message, request_id } = envelope.data.error;
+    return new ApiError(response.status, code, message, request_id ?? requestId);
+  }
+  return new ApiError(
+    response.status,
+    "unexpected_error",
+    `Request failed with status ${response.status}.`,
+    requestId,
+  );
+}
+
 /**
  * Calls a `/api/v1` endpoint and returns its JSON body, checked against `schema`.
  * Sends the session's access token when there is one. The API works out who is calling from
@@ -60,10 +88,8 @@ export interface ApiRequest {
 export async function apiFetch<T>(path: string, schema: z.ZodType<T>, request: ApiRequest = {}): Promise<T> {
   const { method = "GET", body: payload, signal } = request;
 
-  const headers: Record<string, string> = { Accept: "application/json" };
+  const headers: Record<string, string> = { Accept: "application/json", ...(await authHeaders()) };
   if (payload !== undefined) headers["Content-Type"] = "application/json";
-  const token = apiAuth ? await apiAuth.getAccessToken() : null;
-  if (token) headers.Authorization = `Bearer ${token}`;
 
   let response: Response;
   try {
@@ -81,21 +107,7 @@ export async function apiFetch<T>(path: string, schema: z.ZodType<T>, request: A
   const body: unknown = response.status === 204 ? undefined : await response.json().catch(() => null);
   const requestId = response.headers.get("X-Request-ID") ?? undefined;
 
-  if (!response.ok) {
-    if (response.status === 401) apiAuth?.onUnauthorized();
-
-    const envelope = errorEnvelopeSchema.safeParse(body);
-    if (envelope.success) {
-      const { code, message, request_id } = envelope.data.error;
-      throw new ApiError(response.status, code, message, request_id ?? requestId);
-    }
-    throw new ApiError(
-      response.status,
-      "unexpected_error",
-      `Request failed with status ${response.status}.`,
-      requestId,
-    );
-  }
+  if (!response.ok) throw errorFor(response, body);
 
   const parsed = schema.safeParse(body);
   if (!parsed.success) {

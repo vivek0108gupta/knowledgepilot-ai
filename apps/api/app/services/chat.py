@@ -38,9 +38,9 @@ from app.services import chat_history
 from app.services import conversations as conversation_service
 from app.services import search as search_service
 from app.services.citations import FinalAnswer, InvalidAnswer, finalize
-from app.services.context_builder import build_context
+from app.services.context_builder import Context, build_context
 from app.services.embeddings import Embedder, EmbedderProvider, EmbeddingError
-from app.services.llm import ChatModel, ChatModelProvider, LLMError, Turn
+from app.services.llm import ChatModel, ChatModelProvider, Generation, LLMError, Turn
 from app.services.prompts import (
     ANSWER_SCHEMA,
     ANSWER_SCHEMA_NAME,
@@ -62,6 +62,7 @@ GENERATION_ERROR_CODES = frozenset(
         "ai_misconfigured",
         "ai_rejected",
         "ai_invalid_response",
+        "ai_answer_too_long",
         "embeddings_unavailable",
         "answer_not_saved",
     }
@@ -104,6 +105,13 @@ def ai_error(error: LLMError) -> AppError:
             503,
             "ai_misconfigured",
             "Answering is not available right now. Your question was saved.",
+        )
+    if error.code == "too_long":
+        return AppError(
+            502,
+            "ai_answer_too_long",
+            "The answer was too long to finish. Your question was saved; try asking for less "
+            "at once.",
         )
     if error.code == "invalid_response":
         return AppError(
@@ -256,17 +264,38 @@ async def retrieve(
     return sorted(best.values(), key=lambda match: match.similarity, reverse=True)[:top_k]
 
 
-async def produce(
+@dataclass(frozen=True, slots=True)
+class Prepared:
+    """Everything the model is given for one answer, or no context when nothing relevant was
+    found (then no model call is made)."""
+
+    context: Context | None
+    instructions: str
+    turns: list[Turn]
+    retrieval: dict[str, Any]
+
+
+def no_evidence_answer(retrieval: dict[str, Any]) -> Answer:
+    return Answer(
+        FinalAnswer(NO_ANSWER, [], grounded=False, reason="no_evidence"),
+        model=None,
+        input_tokens=None,
+        output_tokens=None,
+        retrieval={**retrieval, "used": 0},
+    )
+
+
+async def prepare(
     session: AsyncSession,
     embedder: Embedder,
-    model: ChatModel,
     turn: PendingAnswer,
     user_id: uuid.UUID,
     question: str,
     top_k: int,
     document_ids: list[uuid.UUID],
     settings: Settings,
-) -> Answer:
+) -> Prepared:
+    """History, retrieval and context: what the model will see."""
     history = await chat_history.recent_turns(
         session,
         turn.user_message.conversation_id,
@@ -297,15 +326,9 @@ async def produce(
     }
 
     if not matches:
-        # Nothing relevant: answer honestly without spending a model call.
+        await session.rollback()
         logger.info("No passage reached the similarity threshold; answering without the model")
-        return Answer(
-            FinalAnswer(NO_ANSWER, [], grounded=False, reason="no_evidence"),
-            model=None,
-            input_tokens=None,
-            output_tokens=None,
-            retrieval={**retrieval, "used": 0},
-        )
+        return Prepared(None, "", [], retrieval)
 
     context = build_context(
         matches,
@@ -316,38 +339,64 @@ async def produce(
     retrieval["context_tokens"] = context.tokens
     # Evidence first, then the question, in one user turn after the earlier conversation.
     latest = Turn(role="user", content=f"{context.text}\n\nQuestion:\n{question}")
+    # End the read transaction: no connection is held while the model writes.
+    await session.rollback()
+    return Prepared(context, system_prompt(context.boundary), [*history, latest], retrieval)
 
-    try:
-        generation = await model.generate(
-            instructions=system_prompt(context.boundary),
-            turns=[*history, latest],
-            schema=ANSWER_SCHEMA,
-            schema_name=ANSWER_SCHEMA_NAME,
-        )
-    except LLMError as error:
-        raise ai_error(error) from error
 
+def conclude(conversation_id: uuid.UUID, prepared: Prepared, generation: Generation) -> Answer:
+    """Check the model's whole output against the evidence it was given."""
+    assert prepared.context is not None
     try:
-        final = finalize(generation, context)
+        final = finalize(generation, prepared.context)
     except InvalidAnswer as error:
         logger.error("Model output rejected: %s", error)
         raise ai_error(LLMError(str(error), code="invalid_response", retryable=False)) from error
 
     logger.info(
         "Answer for conversation %s: grounded=%s, %d citation(s), %d dropped, %d passage(s) used",
-        turn.user_message.conversation_id,
+        conversation_id,
         final.grounded,
         len(final.citations),
         final.dropped_citations,
-        len(context.sources),
+        len(prepared.context.sources),
     )
     return Answer(
         final,
         model=generation.model,
         input_tokens=generation.input_tokens,
         output_tokens=generation.output_tokens,
-        retrieval=retrieval,
+        retrieval=prepared.retrieval,
     )
+
+
+async def produce(
+    session: AsyncSession,
+    embedder: Embedder,
+    model: ChatModel,
+    turn: PendingAnswer,
+    user_id: uuid.UUID,
+    question: str,
+    top_k: int,
+    document_ids: list[uuid.UUID],
+    settings: Settings,
+) -> Answer:
+    prepared = await prepare(
+        session, embedder, turn, user_id, question, top_k, document_ids, settings
+    )
+    if prepared.context is None:
+        # Nothing relevant: answer honestly without spending a model call.
+        return no_evidence_answer(prepared.retrieval)
+    try:
+        generation = await model.generate(
+            instructions=prepared.instructions,
+            turns=prepared.turns,
+            schema=ANSWER_SCHEMA,
+            schema_name=ANSWER_SCHEMA_NAME,
+        )
+    except LLMError as error:
+        raise ai_error(error) from error
+    return conclude(turn.user_message.conversation_id, prepared, generation)
 
 
 async def save(
@@ -356,6 +405,7 @@ async def save(
     user_id: uuid.UUID,
     user_message: Message,
     answer: Answer,
+    message_id: uuid.UUID | None = None,
 ) -> Message:
     """Store the answer and release the lease, in one transaction."""
     conversation = await conversation_service.get_owned(
@@ -371,7 +421,7 @@ async def save(
 
     final = answer.final
     message = Message(
-        id=uuid.uuid4(),
+        id=message_id or uuid.uuid4(),
         conversation_id=conversation.id,
         role=MessageRole.ASSISTANT.value,
         content=final.content,
@@ -389,6 +439,8 @@ async def save(
             "reason": final.reason,
             "dropped_citations": final.dropped_citations,
             "unverified_quotes": final.unverified_quotes,
+            "approximate_quotes": final.approximate_quotes,
+            "unmarked_citations": final.unmarked_citations,
             "retrieval": answer.retrieval,
         },
     )

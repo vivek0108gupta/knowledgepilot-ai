@@ -4,6 +4,8 @@ The model cites sources by the short ids it was shown (S1, S2...). Nothing it re
 trusted: every id is looked up in that request's own context, and every citation is built
 from the stored chunk, never from what the model wrote. An id that was not supplied is
 dropped. An answer left with no valid citation is treated as unsupported and replaced.
+
+Every citation shown has a marker in the answer text, and every marker has a citation.
 """
 
 import json
@@ -61,6 +63,10 @@ class FinalAnswer:
     reason: str | None = None
     dropped_citations: int = 0
     unverified_quotes: int = 0
+    # Quotes located from a long run of their words rather than in full.
+    approximate_quotes: int = 0
+    # Valid sources the model listed but never marked in a text that marks others.
+    unmarked_citations: int = 0
     notes: dict[str, Any] = field(default_factory=dict)
 
 
@@ -85,6 +91,11 @@ def fallback_excerpt(content: str) -> str:
 # A quote shortened with an ellipsis is matched piece by piece, in order.
 ELLIPSIS = re.compile(r"\s*(?:\.\.\.|…)\s*")
 MIN_QUOTE_CHARACTERS = 12
+SOFT_HYPHEN = "\u00ad"
+HYPHEN_BREAK = re.compile(r"[ \t]*\r?\n\s*(?=\w)")
+# A quote that is not in the passage word for word is still located from its longest run of
+# consecutive words that is, if the run is at least this long.
+MIN_RUN_WORDS = 6
 
 
 def comparable(text: str) -> tuple[str, list[int]]:
@@ -94,7 +105,16 @@ def comparable(text: str) -> tuple[str, list[int]]:
     out: list[str] = []
     positions: list[int] = []
     gap = True
+    skip_to = 0
     for position, character in enumerate(text):
+        if position < skip_to or character == SOFT_HYPHEN:
+            continue
+        if character in "-‐" and out and not gap:
+            # "environ-\nment", as PDF text often has it, compares as "environment".
+            rest = HYPHEN_BREAK.match(text, position + 1)
+            if rest is not None:
+                skip_to = rest.end()
+                continue
         for folded in unicodedata.normalize("NFKC", character).casefold():
             if folded.isalnum():
                 out.append(folded)
@@ -130,22 +150,65 @@ def locate(quote: str, passage: str) -> tuple[int, int] | None:
     return positions[first], positions[last] + 1
 
 
-def excerpt_for(source: Source, quotes: list[str]) -> tuple[str, bool]:
-    """A short excerpt of the source, and whether it was located from the model's quote.
+def longest_run(quote: str, passage: str) -> tuple[int, int] | None:
+    """The span of the longest run of the quote's consecutive words found, in the same order,
+    in the passage: for quotes the model shortened, merged or slightly reworded."""
+    quote_words = comparable(quote)[0].split()
+    haystack, positions = comparable(passage)
+    words = haystack.split(" ") if haystack else []
+    # Character offset of each passage word in `haystack`.
+    offsets: list[int] = []
+    cursor = 0
+    for word in words:
+        offsets.append(cursor)
+        cursor += len(word) + 1
+    best_length = best_end = 0
+    previous = [0] * (len(words) + 1)
+    for quote_word in quote_words:
+        current = [0] * (len(words) + 1)
+        for index, word in enumerate(words, start=1):
+            if word == quote_word:
+                current[index] = previous[index - 1] + 1
+                if current[index] > best_length:
+                    best_length, best_end = current[index], index
+        previous = current
+    if best_length < MIN_RUN_WORDS:
+        return None
+    first_word, last_word = best_end - best_length, best_end - 1
+    start = offsets[first_word]
+    end = offsets[last_word] + len(words[last_word]) - 1
+    return positions[start], positions[end] + 1
+
+
+def excerpt_for(source: Source, quotes: list[str]) -> tuple[str, str]:
+    """A short excerpt of the source, and how it was found: "exact" (the quote is in the
+    passage, allowing for case, punctuation and layout), "approximate" (a long run of the
+    quote's words is), "unverified" (the quote could not be found) or "none" (no quote).
 
     The model's quote only says where to look: the excerpt is always the document's own text
-    at that place. A quote that cannot be found in the passage is ignored, and the start of
-    the passage is shown instead.
+    at that place. A quote that cannot be found is ignored, and the start of the passage is
+    shown instead.
     """
     passage = source.match.content
+    found: tuple[tuple[int, int], str] | None = None
     for quote in quotes:
         span = locate(quote, passage)
         if span is not None:
-            text = " ".join(passage[span[0] : span[1]].split())
-            if len(text) > MAX_EXCERPT_LENGTH:
-                text = text[: MAX_EXCERPT_LENGTH - 1].rstrip() + "…"
-            return text, True
-    return fallback_excerpt(passage), not quotes
+            found = (span, "exact")
+            break
+    if found is None:
+        for quote in quotes:
+            span = longest_run(quote, passage)
+            if span is not None:
+                found = (span, "approximate")
+                break
+    if found is None:
+        return fallback_excerpt(passage), "unverified" if quotes else "none"
+    (start, end), how = found
+    text = " ".join(passage[start:end].split())
+    if len(text) > MAX_EXCERPT_LENGTH:
+        text = text[: MAX_EXCERPT_LENGTH - 1].rstrip() + "…"
+    return text, how
 
 
 def citation(number: int, source: Source, excerpt: str) -> dict[str, Any]:
@@ -208,24 +271,36 @@ def finalize(generation: Generation, context: Context) -> FinalAnswer:
         return f"{marker.group(1)}[{', '.join(str(number) for number in valid)}]"
 
     content = MARKER.sub(rewrite, text).strip()
+    marked = bool(numbers)
 
-    # Sources cited with a quote but never marked in the text still count, after the others.
     quotes: dict[str, list[str]] = {}
+    unmarked: set[str] = set()
     for cited in answer.citations:
         source_id = cited.source_id.strip()
-        if number_for(source_id) is not None:
+        if source_id not in sources:
+            dropped.add(source_id)
+        elif source_id in numbers or not marked:
+            # When the text marks no source at all, the listed sources are marked at the end
+            # of the answer instead, so that every citation still has a marker.
+            number_for(source_id)
             quotes.setdefault(source_id, []).append(cited.quote)
+        else:
+            # Listed but not tied to anything the answer says: not shown.
+            unmarked.add(source_id)
 
     if dropped:
         logger.warning("Dropped %d citation(s) to sources that were not supplied", len(dropped))
     if not numbers:
         return not_found("no_valid_citations", dropped=len(dropped))
+    if not marked:
+        content = f"{content} [{', '.join(str(number) for number in sorted(numbers.values()))}]"
 
     built: list[dict[str, Any]] = []
-    unverified = 0
+    unverified = approximate = 0
     for source_id, number in sorted(numbers.items(), key=lambda item: item[1]):
-        excerpt, verified = excerpt_for(sources[source_id], quotes.get(source_id, []))
-        unverified += not verified
+        excerpt, how = excerpt_for(sources[source_id], quotes.get(source_id, []))
+        unverified += how == "unverified"
+        approximate += how == "approximate"
         built.append(citation(number, sources[source_id], excerpt))
 
     return FinalAnswer(
@@ -234,4 +309,6 @@ def finalize(generation: Generation, context: Context) -> FinalAnswer:
         grounded=True,
         dropped_citations=len(dropped),
         unverified_quotes=unverified,
+        approximate_quotes=approximate,
+        unmarked_citations=len(unmarked),
     )

@@ -57,6 +57,8 @@ class Settings(BaseSettings):
     chat_temperature: float = 0.2
     chat_max_output_tokens: int = 1000
     chat_timeout_seconds: float = 45.0
+    # The most a streamed answer may take from request to last word.
+    chat_stream_timeout_seconds: float = 120.0
     chat_max_attempts: int = 3
     # Passages retrieved per question, and the most a request may ask for.
     chat_top_k: int = 5

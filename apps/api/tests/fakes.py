@@ -141,6 +141,14 @@ class FakeChatModel:
         self.delay = 0.0
         # Builds the raw output from the request. Defaults to citing the first passage.
         self.reply = grounded_reply
+        # Streaming: output is sent in pieces of this many characters.
+        self.chunk_size = 7
+        # Raise `fail` after this many pieces have been sent (None: before any).
+        self.fail_after: int | None = None
+        # Seconds to wait before each piece.
+        self.chunk_delay = 0.0
+        # Set when a stream was closed, however it ended.
+        self.streams_closed = 0
 
     async def generate(self, *, instructions, turns, schema, schema_name):  # noqa: ANN001, ANN201
         from app.services.llm import Generation
@@ -155,3 +163,30 @@ class FakeChatModel:
         return Generation(
             text=text, refused=self.refuse, model="fake-model-1", input_tokens=120, output_tokens=30
         )
+
+    async def stream(self, *, instructions, turns, schema, schema_name):  # noqa: ANN001, ANN201
+        from app.services.llm import Generation, TextDelta
+
+        call = {"instructions": instructions, "turns": list(turns), "schema": schema}
+        self.calls.append(call)
+        try:
+            if self.delay:
+                await asyncio.sleep(self.delay)
+            if self.fail is not None and self.fail_after is None:
+                raise self.fail
+            text = "" if self.refuse else self.reply(call)
+            for index in range(0, len(text), self.chunk_size):
+                if self.fail is not None and index // self.chunk_size == self.fail_after:
+                    raise self.fail
+                if self.chunk_delay:
+                    await asyncio.sleep(self.chunk_delay)
+                yield TextDelta(text[index : index + self.chunk_size])
+            yield Generation(
+                text=text,
+                refused=self.refuse,
+                model="fake-model-1",
+                input_tokens=120,
+                output_tokens=30,
+            )
+        finally:
+            self.streams_closed += 1

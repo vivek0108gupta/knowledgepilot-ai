@@ -235,6 +235,10 @@ describe("asking", () => {
   test.each([
     [new ApiError(503, "ai_unavailable", "Saved; try again."), true],
     [new ApiError(502, "ai_invalid_response", "x"), true],
+    [new ApiError(502, "ai_answer_too_long", "x"), true],
+    [new ApiError(500, "answer_failed", "x"), true],
+    [new ApiError(409, "answer_superseded", "x"), true],
+    [new ApiError(0, "stream_interrupted", "x"), true],
     [new ApiError(503, "embeddings_unavailable", "x"), true],
     [new ApiError(500, "answer_not_saved", "x"), true],
     [new ApiError(409, "answer_in_progress", "x"), true],

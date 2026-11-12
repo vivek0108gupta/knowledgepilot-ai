@@ -238,10 +238,23 @@ class TestFailures:
         assert caught.value.code == "rejected"
         assert len(api.requests) == 1
 
+    async def test_an_answer_cut_off_by_the_output_limit_is_too_long(self) -> None:
+        api = Api()
+        api.body = response_body(
+            status="incomplete", incomplete_details={"reason": "max_output_tokens"}
+        )
+        model, _ = api.model()
+
+        with pytest.raises(LLMError) as caught:
+            await generate(model)
+
+        assert (caught.value.code, caught.value.retryable) == ("too_long", False)
+        assert len(api.requests) == 1
+
     @pytest.mark.parametrize(
         "overrides",
         [
-            {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}},
+            {"status": "incomplete", "incomplete_details": {"reason": "content_filter"}},
             {"status": "failed"},
             {
                 "output": [
@@ -256,7 +269,7 @@ class TestFailures:
             },
             {"output": []},
         ],
-        ids=["cut off", "failed", "blank text", "no output"],
+        ids=["filtered", "failed", "blank text", "no output"],
     )
     async def test_unusable_responses_are_invalid(self, overrides: dict) -> None:
         api = Api()

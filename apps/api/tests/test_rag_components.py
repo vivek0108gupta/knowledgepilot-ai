@@ -1,6 +1,7 @@
 """The pure parts of answering: context building, citation validation, prompt and queries."""
 
 import json
+import re
 import uuid
 
 import pytest
@@ -454,3 +455,95 @@ class TestRetrievalQueries:
         queries = retrieval_queries("Next?", history)
 
         assert len(queries[1]) <= 1500 + len("\nNext?")
+
+
+class TestEveryCitationHasAMarker:
+    def context(self):  # noqa: ANN201
+        return build_context([REFUND, SHIPPING], token_budget=6000, max_per_document=3)
+
+    def test_a_source_listed_but_never_marked_is_not_shown(self) -> None:
+        final = finalize(
+            answer("Refunds take 30 days [S1].", ("S1", "within 30 days"), ("S2", "two business")),
+            self.context(),
+        )
+
+        assert final.content == "Refunds take 30 days [1]."
+        assert [c["number"] for c in final.citations] == [1]
+        assert final.unmarked_citations == 1
+
+    def test_an_answer_with_no_markers_gets_them_for_its_listed_sources(self) -> None:
+        final = finalize(
+            answer("Refunds take 30 days.", ("S1", "within 30 days"), ("S9", "invented")),
+            self.context(),
+        )
+
+        assert final.content == "Refunds take 30 days. [1]"
+        assert [c["number"] for c in final.citations] == [1]
+        assert final.dropped_citations == 1
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Refunds take 30 days [S1]; shipping takes two days [S2].",
+            "Both [S2, S1] apply.",
+            "Shipping [S2]. Refunds [S1]. Shipping again [S2].",
+            "Refunds take 30 days.",
+        ],
+    )
+    def test_markers_and_citations_always_correspond(self, text: str) -> None:
+        final = finalize(
+            answer(text, ("S1", "within 30 days"), ("S2", "two business days")), self.context()
+        )
+
+        markers = {
+            int(n)
+            for group in re.findall(r"\[([\d, ]+)\]", final.content)
+            for n in group.split(",")
+        }
+        assert markers == {c["number"] for c in final.citations}
+        assert [c["number"] for c in final.citations] == list(range(1, len(final.citations) + 1))
+
+
+class TestApproximateQuotes:
+    PASSAGE = (
+        "Module 3 covered the retrieval layer. The team created the Python project environment "
+        "with uv and pinned every dependency, then wrote tests for the parser."
+    )
+
+    def find(self, quote: str):  # noqa: ANN201
+        context = build_context(
+            [match(self.PASSAGE, 0.9, page_number=2)], token_budget=6000, max_per_document=3
+        )
+        return finalize(answer("It used uv [S1].", ("S1", quote)), context)
+
+    def test_a_reworded_quote_is_located_by_its_longest_run_of_words(self) -> None:
+        final = self.find("We created the Python project environment with uv and pinned all of it")
+
+        assert (
+            final.citations[0]["excerpt"]
+            == "created the Python project environment with uv and pinned"
+        )
+        assert (final.approximate_quotes, final.unverified_quotes) == (1, 0)
+
+    def test_words_hyphenated_across_lines_are_matched(self) -> None:
+        context = build_context(
+            [match("The project environ-\nment was created with uv.", 0.9, page_number=1)],
+            token_budget=6000,
+            max_per_document=3,
+        )
+
+        final = finalize(answer("Yes [S1].", ("S1", "project environment was created")), context)
+
+        assert final.citations[0]["excerpt"] == "project environ- ment was created"
+        assert final.unverified_quotes == 0
+
+    def test_a_few_shared_words_are_not_enough(self) -> None:
+        final = self.find("the team wrote nothing about Python at all")
+
+        assert final.citations[0]["excerpt"].startswith("Module 3 covered")
+        assert (final.approximate_quotes, final.unverified_quotes) == (0, 1)
+
+    def test_the_excerpt_is_always_the_documents_own_text(self) -> None:
+        final = self.find("THE TEAM CREATED THE PYTHON PROJECT ENVIRONMENT WITH UV")
+
+        assert final.citations[0]["excerpt"] in self.PASSAGE

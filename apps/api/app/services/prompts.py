@@ -96,6 +96,9 @@ _FINGERPRINTS = (
     "your earlier answers are not evidence",
 )
 
+# The longest text that `leaks_instructions` looks for, in characters.
+LONGEST_LEAK_SIGNAL = max(*(len(phrase) for phrase in _FINGERPRINTS), 16)
+
 
 def system_prompt(boundary: str) -> str:
     """The instructions for one request. `boundary` is the random tag suffix used for that

@@ -4,16 +4,20 @@ The only module that knows a provider's API. It takes instructions, conversation
 JSON schema for the output, and returns the raw output with token counts. It knows nothing
 about documents, prompts or citations.
 
+Output comes back whole (`generate`) or as it is written (`stream`). Both send the same
+request and fail in the same way.
+
 Neither the instructions, the turns nor the output are ever logged, and neither is the key.
 """
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Literal, Protocol
 
+import anyio
 import openai
 
 from app.core.config import get_settings
@@ -44,6 +48,18 @@ class Generation:
     output_tokens: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class TextDelta:
+    """A piece of output, in the order the model writes it. Raw output: for a JSON schema,
+    a fragment of the JSON document."""
+
+    text: str
+
+
+# What `stream` yields: text pieces, then exactly one Generation for the whole output.
+StreamEvent = TextDelta | Generation
+
+
 class LLMError(Exception):
     """Generation failed. `code` says why; the message never contains request content.
 
@@ -51,6 +67,7 @@ class LLMError(Exception):
     misconfigured     the key, permissions or model name were rejected
     rejected          the request itself was refused (for example, too long)
     invalid_response  the model returned nothing usable
+    too_long          the answer reached the output token limit before it was finished
     """
 
     def __init__(self, message: str, *, code: str, retryable: bool) -> None:
@@ -65,6 +82,13 @@ class ChatModel(Protocol):
     async def generate(
         self, *, instructions: str, turns: list[Turn], schema: dict[str, Any], schema_name: str
     ) -> Generation: ...
+
+    def stream(
+        self, *, instructions: str, turns: list[Turn], schema: dict[str, Any], schema_name: str
+    ) -> AsyncIterator[StreamEvent]:
+        """Text pieces as they are written, then the whole Generation. Closing the iterator
+        early stops the generation upstream."""
+        ...
 
 
 ChatModelProvider = Callable[[], ChatModel]
@@ -82,6 +106,7 @@ class OpenAIResponsesModel:
         max_output_tokens: int,
         max_attempts: int = 3,
         base_delay_seconds: float = 1.0,
+        stream_timeout_seconds: float = 120.0,
         sleep: Sleep = asyncio.sleep,
     ) -> None:
         if max_attempts < 1:
@@ -92,71 +117,155 @@ class OpenAIResponsesModel:
         self._max_output_tokens = max_output_tokens
         self._max_attempts = max_attempts
         self._base_delay = base_delay_seconds
+        self._stream_timeout = stream_timeout_seconds
         self._sleep = sleep
+
+    def _request(
+        self, instructions: str, turns: list[Turn], schema: dict[str, Any], schema_name: str
+    ) -> dict[str, Any]:
+        return {
+            "model": self._model,
+            "instructions": instructions,
+            "input": [{"role": turn.role, "content": turn.content} for turn in turns],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": schema_name,
+                    "schema": schema,
+                    "strict": True,
+                }
+            },
+            "temperature": self._temperature,
+            "max_output_tokens": self._max_output_tokens,
+            # Do not keep the conversation on OpenAI's side.
+            "store": False,
+        }
+
+    def _permanent(self, error: openai.OpenAIError) -> LLMError:
+        """An error that resending cannot fix."""
+        if isinstance(error, openai.APIStatusError):
+            logger.error("Model request rejected with status %d", error.status_code)
+            if error.status_code in MISCONFIGURED_STATUSES:
+                return LLMError(
+                    "The AI service rejected the server's configuration.",
+                    code="misconfigured",
+                    retryable=False,
+                )
+            return LLMError(
+                "The AI service rejected the request.", code="rejected", retryable=False
+            )
+        logger.error("Model request failed: %s", type(error).__name__)
+        return LLMError("The AI service returned an error.", code="unavailable", retryable=False)
+
+    async def _before_retry(self, attempt: int, error: Exception) -> None:
+        """Wait before the next attempt, or raise if this was the last one."""
+        if attempt == self._max_attempts:
+            logger.error(
+                "Model request failed after %d attempts: %s", attempt, type(error).__name__
+            )
+            raise unavailable() from error
+        delay = backoff_delay(attempt, self._base_delay, error)
+        logger.warning(
+            "Model request failed (%s); attempt %d of %d, retrying in %.1fs",
+            type(error).__name__,
+            attempt,
+            self._max_attempts,
+            delay,
+        )
+        await self._sleep(delay)
 
     async def generate(
         self, *, instructions: str, turns: list[Turn], schema: dict[str, Any], schema_name: str
     ) -> Generation:
+        request = self._request(instructions, turns, schema, schema_name)
         for attempt in range(1, self._max_attempts + 1):
             try:
-                response = await self._client.responses.create(
-                    model=self._model,
-                    instructions=instructions,
-                    input=[{"role": turn.role, "content": turn.content} for turn in turns],
-                    text={
-                        "format": {
-                            "type": "json_schema",
-                            "name": schema_name,
-                            "schema": schema,
-                            "strict": True,
-                        }
-                    },
-                    temperature=self._temperature,
-                    max_output_tokens=self._max_output_tokens,
-                    # Do not keep the conversation on OpenAI's side.
-                    store=False,
-                )
+                response = await self._client.responses.create(**request)
             except TRANSIENT_ERRORS as error:
-                if attempt == self._max_attempts:
-                    logger.error(
-                        "Model request failed after %d attempts: %s", attempt, type(error).__name__
-                    )
-                    raise LLMError(
-                        "The AI service is busy or unreachable.", code="unavailable", retryable=True
-                    ) from error
-                delay = backoff_delay(attempt, self._base_delay, error)
-                logger.warning(
-                    "Model request failed (%s); attempt %d of %d, retrying in %.1fs",
-                    type(error).__name__,
-                    attempt,
-                    self._max_attempts,
-                    delay,
-                )
-                await self._sleep(delay)
-            except openai.APIStatusError as error:
-                logger.error("Model request rejected with status %d", error.status_code)
-                if error.status_code in MISCONFIGURED_STATUSES:
-                    raise LLMError(
-                        "The AI service rejected the server's configuration.",
-                        code="misconfigured",
-                        retryable=False,
-                    ) from error
-                raise LLMError(
-                    "The AI service rejected the request.", code="rejected", retryable=False
-                ) from error
+                await self._before_retry(attempt, error)
             except openai.OpenAIError as error:
-                logger.error("Model request failed: %s", type(error).__name__)
-                raise LLMError(
-                    "The AI service returned an error.", code="unavailable", retryable=False
-                ) from error
+                raise self._permanent(error) from error
             else:
                 return self._read(response)
         raise AssertionError("unreachable")  # pragma: no cover
+
+    async def stream(
+        self, *, instructions: str, turns: list[Turn], schema: dict[str, Any], schema_name: str
+    ) -> AsyncIterator[StreamEvent]:
+        """Stream the output. A failure before any text has been yielded is retried like
+        `generate`; once text has been yielded, a failure ends the stream with an LLMError,
+        since the caller has already used part of the output.
+
+        The whole stream must finish within `stream_timeout_seconds`, and each wait for the
+        next event is bounded by the client's own timeout.
+        """
+        request = self._request(instructions, turns, schema, schema_name)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._stream_timeout
+        for attempt in range(1, self._max_attempts + 1):
+            started = False
+            try:
+                upstream = await asyncio.wait_for(
+                    self._client.responses.create(**request, stream=True),
+                    max(deadline - loop.time(), 0.001),
+                )
+                try:
+                    events = upstream.__aiter__()
+                    while True:
+                        try:
+                            event = await asyncio.wait_for(
+                                events.__anext__(), max(deadline - loop.time(), 0.001)
+                            )
+                        except StopAsyncIteration:
+                            logger.error("Model stream ended without a final response")
+                            raise LLMError(
+                                "The AI service did not finish its answer.",
+                                code="invalid_response",
+                                retryable=False,
+                            ) from None
+                        kind = getattr(event, "type", None)
+                        if kind == "response.output_text.delta":
+                            if event.delta:
+                                started = True
+                                yield TextDelta(event.delta)
+                        elif kind in ("response.completed", "response.incomplete"):
+                            yield self._read(event.response)
+                            return
+                        elif kind == "response.failed":
+                            raise self._failed(getattr(event.response, "error", None))
+                        elif kind == "error":
+                            raise self._failed(event)
+                finally:
+                    # Stops generation upstream when the caller stops early, even while the
+                    # caller is being cancelled.
+                    with anyio.CancelScope(shield=True):
+                        await upstream.close()
+            except (*TRANSIENT_ERRORS, TimeoutError) as error:
+                if started or loop.time() >= deadline:
+                    logger.error("Model stream failed: %s", type(error).__name__)
+                    raise unavailable() from error
+                await self._before_retry(attempt, error)
+            except openai.OpenAIError as error:
+                raise self._permanent(error) from error
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def _failed(self, error: Any) -> LLMError:  # noqa: ANN401 - the SDK's error objects
+        """An error reported inside the stream. Only its code is logged, never its message."""
+        code = getattr(error, "code", None) or "unknown"
+        logger.error("Model stream reported an error: %s", code)
+        if code in ("rate_limit_exceeded", "server_error", "server_is_overloaded", "timeout"):
+            return unavailable()
+        return LLMError("The AI service could not answer.", code="rejected", retryable=False)
 
     def _read(self, response: Any) -> Generation:  # noqa: ANN401 - the SDK's Response
         if response.status != "completed":
             reason = getattr(response.incomplete_details, "reason", None) or response.status
             logger.error("Model response was not completed: %s", reason)
+            if reason == "max_output_tokens":
+                # An unfinished answer cannot be checked, and asking again gets the same.
+                raise LLMError(
+                    "The answer reached the output limit.", code="too_long", retryable=False
+                )
             raise LLMError(
                 "The AI service did not finish its answer.",
                 code="invalid_response",
@@ -188,6 +297,10 @@ class OpenAIResponsesModel:
         )
 
 
+def unavailable() -> LLMError:
+    return LLMError("The AI service is busy or unreachable.", code="unavailable", retryable=True)
+
+
 def ai_not_configured() -> AppError:
     return AppError(
         503,
@@ -210,4 +323,5 @@ def get_chat_model() -> ChatModel:
         temperature=settings.chat_temperature,
         max_output_tokens=settings.chat_max_output_tokens,
         max_attempts=settings.chat_max_attempts,
+        stream_timeout_seconds=settings.chat_stream_timeout_seconds,
     )
