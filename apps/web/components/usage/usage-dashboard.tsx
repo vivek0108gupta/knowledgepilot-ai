@@ -11,10 +11,12 @@ import { Alert, EmptyState, ErrorState, LoadingRegion, Skeleton } from "@/compon
 import { ApiError, errorMessage } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import {
+  ALERT_LABELS,
   HISTORY_PAGE_SIZE,
   OPERATION_LABELS,
   formatCost,
   formatTokens,
+  getUsageAlerts,
   getUsageHistory,
   getUsageSummary,
   operationSchema,
@@ -347,6 +349,30 @@ function History({ workspaceId, showUser }: { workspaceId: string; showUser: boo
   );
 }
 
+const alertTime = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
+
+/** Thresholds the API recorded as crossed this period. Shown only when there are some. */
+function RecordedAlerts({ workspaceId }: { workspaceId: string }) {
+  const alerts = useQuery({
+    queryKey: usageKeys.alerts(workspaceId),
+    queryFn: ({ signal }) => getUsageAlerts(workspaceId, signal),
+  });
+  if (!alerts.data || alerts.data.length === 0) return null;
+  return (
+    <section aria-label="Usage alerts" className="rounded-xl border border-amber-200 bg-amber-50 p-4">
+      <h2 className="text-sm font-semibold text-amber-900">Usage alerts</h2>
+      <ul className="mt-2 flex flex-col gap-1 text-sm text-amber-900">
+        {alerts.data.map((alert) => (
+          <li key={alert.id}>
+            {alert.threshold_percent}% of {ALERT_LABELS[alert.kind]} reached ·{" "}
+            <time dateTime={alert.created_at}>{alertTime.format(new Date(alert.created_at))}</time>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
 function Overview({ summary }: { summary: UsageSummary }) {
   const { allowance: a, my_allowance: me, currency } = summary;
   const warnings = quotaWarnings(summary);
@@ -424,6 +450,28 @@ function Overview({ summary }: { summary: UsageSummary }) {
           />
         </Panel>
       </div>
+
+      {summary.accounting && (
+        <Panel
+          title="How these numbers were counted"
+          description="Tokens reported by the AI provider are exact. When it reported none, they are counted here (estimated), or, when it is unknown whether the work ran (for example a timeout), the most it could have used is held against your limits."
+        >
+          <dl className="grid gap-3 sm:grid-cols-3">
+            {[
+              ["Reported by the provider", summary.accounting.provider_reported_tokens],
+              ["Estimated", summary.accounting.estimated_tokens],
+              ["Held (outcome unknown)", summary.accounting.held_tokens],
+            ].map(([label, value]) => (
+              <div key={label as string} className="rounded-lg border border-zinc-200 p-3">
+                <dt className="text-xs text-zinc-500">{label}</dt>
+                <dd className="mt-0.5 text-lg font-semibold text-zinc-900 tabular-nums">
+                  {formatTokens(value as number)}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        </Panel>
+      )}
 
       <p className="text-xs text-zinc-500">
         Costs are estimates from price table {summary.pricing_version} ({currency}), not an invoice.
@@ -504,6 +552,7 @@ export function UsageDashboard() {
         action={back}
       />
       <div className="flex flex-col gap-6">
+        <RecordedAlerts workspaceId={workspaceId} />
         <Overview summary={data} />
         <Panel
           title="History"

@@ -66,6 +66,7 @@ async def upload_document(
     await session.rollback()
     # Counted before the body is read, so a refused upload costs no bandwidth.
     await rate_limits.hit(session, rate_limits.upload_per_user(get_settings()), user.id)
+    await service.precheck_ingestion_capacity(session, workspace_id)
     # Release the database connection while the file is received.
     await session.rollback()
     storage = storage_provider()

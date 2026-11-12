@@ -21,7 +21,7 @@ from app.core.config import get_settings
 from app.core.errors import AppError
 from app.models.document import Document, DocumentStatus
 from app.models.workspace import WorkspaceMember, WorkspaceRole
-from app.services import usage
+from app.services import jobs, usage
 from app.services import workspaces as workspace_service
 from app.services.file_validation import ValidatedFile
 from app.services.processing import STALE_AFTER, ProcessingQueue, owns_storage_path
@@ -101,10 +101,38 @@ def ingestion_busy(limit: int) -> AppError:
     )
 
 
-async def ensure_ingestion_capacity(session: AsyncSession, workspace_id: uuid.UUID) -> None:
+async def waiting_documents(session: AsyncSession, workspace_id: uuid.UUID) -> int:
+    return (
+        await session.scalar(
+            select(func.count())
+            .select_from(Document)
+            .where(
+                Document.workspace_id == workspace_id,
+                Document.status.in_(
+                    [DocumentStatus.UPLOADED.value, DocumentStatus.PROCESSING.value]
+                ),
+            )
+        )
+    ) or 0
+
+
+async def precheck_ingestion_capacity(session: AsyncSession, workspace_id: uuid.UUID) -> None:
+    """A cheap, unlocked check before an upload's body is read, so a full workspace is told
+    at once. Not exact: the exact check runs just before the document is committed."""
+    limit = get_settings().max_ingestion_jobs_per_workspace
+    if await waiting_documents(session, workspace_id) >= limit:
+        await session.rollback()
+        raise ingestion_busy(limit)
+
+
+async def ensure_ingestion_capacity(
+    session: AsyncSession, workspace_id: uuid.UUID, *, including_new: bool = False
+) -> None:
     """Refuse more work while the workspace has its maximum number of documents waiting or
     being processed. Takes a workspace lock held until the caller's transaction ends, so two
-    uploads cannot both take the last place."""
+    uploads cannot both take the last place. Callers take it last, just before committing,
+    so it is held for milliseconds rather than for a file transfer. With `including_new`, the
+    caller's own (already flushed) document is among those counted."""
     limit = get_settings().max_ingestion_jobs_per_workspace
     await usage.lock(session, "ingestion", workspace_id)
     waiting = await session.scalar(
@@ -115,7 +143,7 @@ async def ensure_ingestion_capacity(session: AsyncSession, workspace_id: uuid.UU
             Document.status.in_([DocumentStatus.UPLOADED.value, DocumentStatus.PROCESSING.value]),
         )
     )
-    if (waiting or 0) >= limit:
+    if (waiting or 0) - (1 if including_new else 0) >= limit:
         await session.rollback()
         raise ingestion_busy(limit)
 
@@ -139,7 +167,6 @@ async def create(
     )
     if existing_name is not None:
         raise duplicate(existing_name)
-    await ensure_ingestion_capacity(session, workspace_id)
 
     document_id = uuid.uuid4()
     # Built only from server-generated IDs and a sanitised ASCII name: nothing in this path
@@ -172,6 +199,11 @@ async def create(
         raise
 
     try:
+        # Exact, under a short workspace lock: refused here, the stored file is removed.
+        await ensure_ingestion_capacity(session, workspace_id, including_new=True)
+        # The document and its ingestion job are committed together, so neither exists
+        # without the other.
+        await jobs.enqueue(session, document.id, commit=False)
         await session.commit()
     except BaseException:
         # The file is stored but its record is not: remove the orphaned file.
@@ -289,6 +321,8 @@ async def retry(
 
     document.status = DocumentStatus.UPLOADED.value
     document.error = None
+    await session.flush()
+    await jobs.enqueue(session, document.id, commit=False)
     await session.commit()
     await session.refresh(document)
     queue.enqueue(document.id)

@@ -558,6 +558,18 @@ environment variables (see `.env.example`).
 - [Testing](docs/security-cost-controls-testing.md): what is covered, and results.
 - [Audit](docs/security-cost-controls-audit.md): the findings that led to it.
 
+Phase 5.5 hardened it:
+- search embeddings are reserved;
+- every usage record states what happened at the provider and whether its numbers are
+  reported, estimated or held;
+- abandoned reservations are recovered;
+- ingestion runs on a durable PostgreSQL job queue;
+- owners can set member limits and alert thresholds, with an audit log.
+
+See the [audit](docs/phase-5.5-reliability-audit.md),
+[architecture](docs/phase-5.5-architecture.md), [operations](docs/phase-5.5-operations.md) and
+[testing](docs/phase-5.5-testing.md) documents.
+
 Refusals use `429` with `rate_limited`, `user_quota_exceeded`, `workspace_quota_exceeded`,
 `concurrent_generation_limit`, `workspace_busy` or `ingestion_busy`, a `retry_after_seconds`
 field and a `Retry-After` header. If limits cannot be checked, the request is refused with
@@ -609,7 +621,7 @@ uv run alembic revision --autogenerate -m "describe the change"
 uv run alembic downgrade -1
 ```
 
-Migrations so far: `0001` pgvector, `0002` workspaces and members, `0003` documents, `0004` document chunks, `0005` conversations and messages, `0006` the answer lease (two nullable columns on `conversations`), `0007` usage metering, workspace quota policies and rate-limit buckets (three new tables). Neither `0005` nor `0006` changes existing data. The API container applies pending migrations when it starts, so `docker compose up --build -d` is enough to upgrade.
+Migrations so far: `0001` pgvector, `0002` workspaces and members, `0003` documents, `0004` document chunks, `0005` conversations and messages, `0006` the answer lease (two nullable columns on `conversations`), `0007` usage metering, workspace quota policies and rate-limit buckets (three new tables). `0008` usage outcomes and recovery fields, durable ingestion jobs, member quotas, usage alerts and an audit log. Neither `0005` nor `0006` changes existing data. The API container applies pending migrations when it starts, so `docker compose up --build -d` is enough to upgrade.
 
 For autogenerate to see a new model, import its module in `app/models/__init__.py`.
 

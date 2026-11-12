@@ -127,6 +127,7 @@ export const LIMIT_CODES = new Set([
   "rate_limited",
   "user_quota_exceeded",
   "workspace_quota_exceeded",
+  "member_quota_exceeded",
   "concurrent_generation_limit",
   "workspace_busy",
   "usage_unavailable",

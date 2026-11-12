@@ -30,8 +30,9 @@ import logging
 import math
 import tempfile
 import uuid
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
 from typing import Protocol
@@ -43,7 +44,7 @@ from app.core.config import get_settings
 from app.core.errors import AppError
 from app.models.chunk import DocumentChunk
 from app.models.document import Document, DocumentSegment, DocumentStatus
-from app.models.usage import UsageOperation, UsageSource, UsageStatus
+from app.models.usage import UsageOperation, UsageOutcome, UsageSource, UsageStatus
 from app.services import usage
 from app.services.chunking import Chunk, chunk_segments
 from app.services.embeddings import EmbedderProvider, EmbeddingError, embed_metered, get_embedder
@@ -72,6 +73,27 @@ UPLOADED = DocumentStatus.UPLOADED.value
 PROCESSING = DocumentStatus.PROCESSING.value
 READY = DocumentStatus.READY.value
 FAILED = DocumentStatus.FAILED.value
+
+
+Progress = Callable[[], Awaitable[None]]
+
+
+class ProcessingResult(StrEnum):
+    """How one processing attempt ended."""
+
+    READY = "ready"  # indexed
+    FAILED = "failed"  # failed for good: the document is marked failed
+    RETRY = "retry"  # failed for a reason that may pass: the document waits to be retried
+    GONE = "gone"  # deleted meanwhile
+    SKIPPED = "skipped"  # not waiting to be processed (already done, or taken)
+
+
+class Retryable(Exception):
+    """A failure worth another attempt. Carries the message to record if none is left."""
+
+    def __init__(self, message: str, code: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class ProcessingQueue(Protocol):
@@ -150,13 +172,30 @@ class EmbeddingMeter:
         self.in_flight = 0
 
     def outcome(self, status: UsageStatus, error_code: str | None = None) -> usage.Outcome:
-        if status == UsageStatus.COMPLETED and self.estimated == 0:
-            return usage.Outcome(status, UsageSource.PROVIDER, self.reported, 0)
+        if self.estimated == 0 and self.in_flight == 0:
+            if self.reported == 0:
+                return usage.Outcome(
+                    status, UsageSource.NONE, error_code=error_code, outcome=UsageOutcome.NOT_CALLED
+                )
+            return usage.Outcome(
+                status,
+                UsageSource.PROVIDER,
+                self.reported,
+                0,
+                error_code=error_code,
+                outcome=UsageOutcome.EXECUTED_WITH_USAGE,
+            )
         # A batch the provider did not report on, or one that was sent when the work
         # stopped, is counted at its own token count: it may have been billed.
         estimated = self.reported + self.estimated + self.in_flight
-        source = UsageSource.ESTIMATED if estimated else UsageSource.NONE
-        return usage.Outcome(status, source, estimated, 0, error_code=error_code)
+        return usage.Outcome(
+            status,
+            UsageSource.ESTIMATED,
+            estimated,
+            0,
+            error_code=error_code,
+            outcome=UsageOutcome.UNKNOWN if self.in_flight else UsageOutcome.EXECUTED_WITHOUT_USAGE,
+        )
 
 
 def ingestion_estimate(extraction: Extraction, chunk_tokens: int, overlap_tokens: int) -> int:
@@ -173,6 +212,7 @@ async def embed_and_store(
     chunks: Iterator[Chunk],
     embedder_provider: EmbedderProvider,
     meter: EmbeddingMeter | None = None,
+    progress: Progress | None = None,
 ) -> int:
     """Embed the chunks a batch at a time and write each batch as it completes.
 
@@ -223,6 +263,8 @@ async def embed_and_store(
             raise DocumentGone
         await session.commit()
         written += len(batch)
+        if progress is not None:
+            await progress()
 
 
 async def finish(
@@ -300,23 +342,50 @@ def failure_message(error: AppError) -> str:
     return "The file could not be read from storage. Try again."
 
 
+async def wait_for_retry(session: AsyncSession, document_id: uuid.UUID) -> None:
+    """Put a document back to wait for its next attempt, leaving no chunks behind."""
+    await session.rollback()
+    await session.execute(delete(DocumentChunk).where(DocumentChunk.document_id == document_id))
+    await session.execute(
+        update(Document)
+        .where(Document.id == document_id, Document.status == PROCESSING)
+        .values(status=UPLOADED, error=None, updated_at=datetime.now(UTC))
+    )
+    await session.commit()
+
+
 async def process_document(
     document_id: uuid.UUID,
     session_factory: SessionFactory,
     storage_provider: StorageProvider,
     embedder_provider: EmbedderProvider,
-) -> None:
+    *,
+    allow_retry: bool = False,
+    attempt_key: str | None = None,
+    on_progress: Progress | None = None,
+) -> ProcessingResult:
     """Extract, chunk and embed one document. Safe to call twice: the second call finds
     nothing to claim.
 
     Never raises for a problem with the document: every failure is recorded on the document
-    with a message its uploader can act on, and leaves no chunks behind.
+    with a message its uploader can act on, and leaves no chunks behind. With `allow_retry`
+    (the job runner, while attempts remain), a failure that may pass (the provider or
+    storage unavailable, the workspace busy) instead puts the document back to wait and
+    returns RETRY. `attempt_key` identifies the attempt, so its usage is reserved once.
     """
     settings = get_settings()
     async with session_factory() as session:
         document = await claim(session, document_id)
         if document is None:
-            return
+            return ProcessingResult.SKIPPED
+
+        async def fail(message: str, code: str) -> ProcessingResult:
+            if allow_retry:
+                logger.info("Document %s will be retried (%s)", document_id, code)
+                await wait_for_retry(session, document_id)
+                return ProcessingResult.RETRY
+            await mark_failed(session, document_id, message)
+            return ProcessingResult.FAILED
 
         try:
             # Checked again here, independently of the request that queued it: this code
@@ -358,15 +427,27 @@ async def process_document(
                     settings.chunk_overlap_tokens,
                 ),
                 output_tokens=0,
-                # One reservation per processing attempt: claiming stamps updated_at.
-                idempotency_key=f"document_embedding:{document.id}:{document.updated_at.isoformat()}",
+                # One reservation per processing attempt: a job attempt's own key, or the
+                # claim's timestamp for a direct call.
+                idempotency_key=attempt_key
+                or f"document_embedding:{document.id}:{document.updated_at.isoformat()}",
                 ttl_seconds=settings.ingestion_reservation_ttl_seconds,
                 document_id=document.id,
             )
             meter = EmbeddingMeter()
+            await usage.mark_called(session, reservation.id, reservation.input_tokens)
+
+            async def progress() -> None:
+                # Keep the reservation (and the job's lease) alive while batches complete.
+                await usage.heartbeat(
+                    session, reservation.id, settings.ingestion_reservation_ttl_seconds
+                )
+                if on_progress is not None:
+                    await on_progress()
+
             try:
                 chunk_count = await embed_and_store(
-                    session, document, chunks, embedder_provider, meter
+                    session, document, chunks, embedder_provider, meter, progress
                 )
             except DocumentGone:
                 await usage.finalize(
@@ -394,34 +475,44 @@ async def process_document(
                     chunk_count,
                     extraction.char_count,
                 )
-            else:
-                await remove_chunks(session, document.id)
+                return ProcessingResult.READY
+            await remove_chunks(session, document.id)
+            return ProcessingResult.GONE
         except DocumentGone:
             # Deleted while processing: its chunks went with it through the foreign key.
             logger.info("Document %s was deleted while it was being processed", document_id)
+            return ProcessingResult.GONE
         except ExtractionError as error:
             logger.info("Document %s could not be extracted or chunked", document_id)
             await mark_failed(session, document_id, str(error))
+            return ProcessingResult.FAILED
         except EmbeddingError as error:
             logger.error(
                 "Document %s failed on embeddings (retryable: %s)", document_id, error.retryable
             )
+            if error.retryable:
+                return await fail(
+                    "The document's text could not be indexed for search. Try again.",
+                    "embeddings_unavailable",
+                )
             await mark_failed(
-                session,
-                document_id,
-                "The document's text could not be indexed for search. Try again."
-                if error.retryable
-                else "The document's text could not be indexed for search.",
+                session, document_id, "The document's text could not be indexed for search."
             )
+            return ProcessingResult.FAILED
         except AppError as error:
             logger.error("Document %s failed: %s", document_id, error.code)
-            await mark_failed(session, document_id, failure_message(error))
+            permanent = error.code.startswith("embeddings_") or (
+                error.code.endswith("_quota_exceeded")
+            )
+            if permanent:
+                await mark_failed(session, document_id, failure_message(error))
+                return ProcessingResult.FAILED
+            # Storage unreachable, the workspace busy, usage checks unavailable: may pass.
+            return await fail(failure_message(error), error.code)
         except Exception:
             # The traceback goes to the logs; the user gets a message with no internals.
             logger.exception("Document %s failed unexpectedly", document_id)
-            await mark_failed(
-                session, document_id, "Something went wrong while processing this document."
-            )
+            return await fail("Something went wrong while processing this document.", "internal")
 
 
 class InProcessQueue:
@@ -508,8 +599,9 @@ async def recover_interrupted(
 
 @lru_cache
 def get_processing_queue() -> ProcessingQueue:
+    """The durable PostgreSQL job queue (app/services/jobs.py). `InProcessQueue` remains for
+    callers that want processing without persistence."""
     from app.core.db import SessionLocal
+    from app.services.jobs import JobQueue
 
-    return InProcessQueue(
-        SessionLocal, get_storage, get_embedder, get_settings().processing_concurrency
-    )
+    return JobQueue(SessionLocal, get_storage, get_embedder, get_settings().processing_concurrency)

@@ -131,6 +131,22 @@ class Settings(BaseSettings):
     # after a crash): it stops counting as running, and its estimate stays charged.
     usage_reservation_ttl_seconds: int = Field(default=600, ge=60)
     ingestion_reservation_ttl_seconds: int = Field(default=3600, ge=60)
+    # A question's embedding takes well under a second; its reservation lasts this long.
+    query_reservation_ttl_seconds: int = Field(default=120, ge=30)
+    # How often running streams and ingestions refresh their reservations, and how often
+    # each API process sweeps for abandoned ones.
+    usage_heartbeat_seconds: int = Field(default=30, ge=5)
+    usage_sweep_interval_seconds: int = Field(default=60, ge=5)
+    # Record an alert when this share of a monthly or daily limit is used (and at 100%).
+    usage_alert_threshold_percent: int = Field(default=80, ge=1, le=100)
+
+    # Durable ingestion jobs (app/services/jobs.py).
+    ingestion_workers_per_workspace: int = Field(default=2, ge=1)
+    ingestion_max_attempts: int = Field(default=3, ge=1, le=20)
+    # A running job not heard from for this long is taken back and retried.
+    ingestion_job_lease_seconds: int = Field(default=600, ge=30)
+    ingestion_retry_delay_seconds: int = Field(default=30, ge=0)
+    ingestion_poll_seconds: float = Field(default=5.0, gt=0)
 
     # Replaces the default price table (app/services/pricing.py) without a code change.
     # JSON: {"version": "...", "currency": "USD", "models": {"<model prefix>":
@@ -143,6 +159,12 @@ class Settings(BaseSettings):
         # answer would be counted as abandoned while it is still being written.
         if self.usage_reservation_ttl_seconds <= self.chat_generation_lease_seconds:
             raise ValueError("USAGE_RESERVATION_TTL_SECONDS must exceed the generation lease")
+        if self.usage_heartbeat_seconds * 2 > min(
+            self.usage_reservation_ttl_seconds, self.ingestion_reservation_ttl_seconds
+        ):
+            raise ValueError(
+                "USAGE_HEARTBEAT_SECONDS must be at most half of every reservation TTL"
+            )
         if self.chat_max_output_tokens < 1 or self.chat_max_output_tokens > 32_768:
             raise ValueError("CHAT_MAX_OUTPUT_TOKENS must be between 1 and 32768")
         return self

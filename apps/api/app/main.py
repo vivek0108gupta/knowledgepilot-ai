@@ -32,7 +32,18 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     except Exception:
         # A database that is not ready yet must not stop the API from starting.
         logger.exception("Could not check for unprocessed documents at startup")
-    yield
+    queue = get_processing_queue()
+    start = getattr(queue, "start", None)
+    if start is not None:
+        # Durable ingestion workers. They also recover abandoned jobs and usage reservations,
+        # first at once and then every USAGE_SWEEP_INTERVAL_SECONDS.
+        start()
+    try:
+        yield
+    finally:
+        stop = getattr(queue, "stop", None)
+        if stop is not None:
+            await stop()
 
 
 def create_app() -> FastAPI:

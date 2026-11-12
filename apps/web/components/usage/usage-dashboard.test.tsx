@@ -14,6 +14,7 @@ const WORKSPACE = "8a5c1f0e-0000-4000-8000-000000000000";
 const mocks = vi.hoisted(() => ({
   getUsageSummary: vi.fn(),
   getUsageHistory: vi.fn(),
+  getUsageAlerts: vi.fn(),
   getWorkspace: vi.fn(),
 }));
 
@@ -22,6 +23,7 @@ vi.mock("@/lib/usage", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/usage")>()),
   getUsageSummary: mocks.getUsageSummary,
   getUsageHistory: mocks.getUsageHistory,
+  getUsageAlerts: mocks.getUsageAlerts,
 }));
 vi.mock("@/lib/workspaces", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/workspaces")>()),
@@ -60,6 +62,7 @@ beforeEach(() => {
     updated_at: "2026-11-11T00:00:00Z",
   });
   mocks.getUsageSummary.mockResolvedValue(summary());
+  mocks.getUsageAlerts.mockResolvedValue([]);
   mocks.getUsageHistory.mockResolvedValue({
     items: [event(1), event(2, { status: "cancelled", usage_source: "estimated" })],
     total: 2,
@@ -175,5 +178,52 @@ describe("usage dashboard", () => {
 
     expect(await screen.findByText("Workspace not found")).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Back to workspace" })).toBeInTheDocument();
+  });
+
+  test("shows how the tokens were counted: reported, estimated or held", async () => {
+    mocks.getUsageSummary.mockResolvedValue(
+      summary({
+        accounting: {
+          provider_reported_tokens: 1200,
+          estimated_tokens: 100,
+          held_tokens: 200,
+          not_charged_records: 1,
+        },
+        outcomes: { executed_with_usage: 3, unknown: 1 },
+      }),
+    );
+    renderWithQuery(<UsageDashboard />);
+
+    const panel = await screen.findByRole("heading", { name: "How these numbers were counted" });
+    const section = panel.closest("section")!;
+    expect(within(section).getByText("Reported by the provider").nextElementSibling).toHaveTextContent(
+      "1,200",
+    );
+    expect(within(section).getByText("Held (outcome unknown)").nextElementSibling).toHaveTextContent("200");
+  });
+
+  test("lists the alerts the API recorded", async () => {
+    mocks.getUsageAlerts.mockResolvedValue([
+      {
+        id: "77777777-7777-4777-8777-777777777777",
+        kind: "workspace_cost",
+        threshold_percent: 80,
+        period_start: "2026-11-01T00:00:00Z",
+        used: "8.10",
+        limit_value: "10.00",
+        created_at: "2026-11-12T10:00:00Z",
+      },
+    ]);
+    renderWithQuery(<UsageDashboard />);
+
+    const alerts = await screen.findByRole("region", { name: "Usage alerts" });
+    expect(alerts).toHaveTextContent("80% of this workspace's monthly spending reached");
+  });
+
+  test("without alerts there is no alert panel", async () => {
+    renderWithQuery(<UsageDashboard />);
+
+    await screen.findByRole("heading", { name: "Usage" });
+    expect(screen.queryByRole("region", { name: "Usage alerts" })).not.toBeInTheDocument();
   });
 });

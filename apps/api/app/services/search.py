@@ -12,6 +12,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 
+import anyio
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,7 +20,7 @@ from app.core.config import get_settings
 from app.core.errors import AppError
 from app.models.chunk import DocumentChunk
 from app.models.document import Document, DocumentStatus
-from app.models.usage import UsageOperation, UsageSource, UsageStatus
+from app.models.usage import UsageOperation, UsageOutcome, UsageSource, UsageStatus
 from app.models.workspace import WorkspaceMember
 from app.services import rate_limits, usage
 from app.services import workspaces as workspace_service
@@ -61,9 +62,6 @@ async def search(
     await workspace_service.get_access(session, workspace_id, user_id)
     await session.rollback()
     await rate_limits.hit(session, rate_limits.search_per_user(get_settings()), user_id)
-    await usage.ensure_available(session, user_id, workspace_id, usage.count_tokens(query))
-    # Do not hold a database connection while waiting on the embedding API.
-    await session.rollback()
 
     (query_vector,) = await embed_query(session, embedder, user_id, workspace_id, [query])
 
@@ -80,42 +78,70 @@ async def embed_query(
     queries: list[str],
     *,
     conversation_id: uuid.UUID | None = None,
+    idempotency_key: str | None = None,
 ) -> list[list[float]]:
-    """Embed search queries (all in one request) and record the usage, whether it succeeds
-    or fails. Used by search and by question answering."""
-    model = get_settings().embedding_model
-    estimate = sum(usage.count_tokens(query) for query in queries)
-    try:
-        embedded = await embed_metered(embedder, queries)
-    except EmbeddingError as error:
-        logger.error("Query embedding failed (retryable: %s)", error.retryable)
-        # A refused request is not billed; one that failed after retries may have been.
-        source = UsageSource.ESTIMATED if error.retryable else UsageSource.NONE
-        await usage.record(
-            session,
-            user_id=user_id,
-            workspace_id=workspace_id,
-            operation=UsageOperation.QUERY_EMBEDDING,
-            model=model,
-            outcome=usage.Outcome(
-                UsageStatus.FAILED, source, estimate, 0, error_code="embeddings_unavailable"
-            ),
-            conversation_id=conversation_id,
-        )
-        raise embeddings_unavailable() from error
-    outcome = (
-        usage.Outcome(UsageStatus.COMPLETED, UsageSource.PROVIDER, embedded.input_tokens, 0)
-        if embedded.input_tokens is not None
-        else usage.Outcome(UsageStatus.COMPLETED, UsageSource.ESTIMATED, estimate, 0)
-    )
-    await usage.record(
+    """Embed search queries (all in one request), as a reserved operation: limits are
+    checked and the tokens reserved before the provider is called, so an exhausted quota
+    stops the call; the provider's count then replaces the reservation. Used by search and
+    by question answering (whose key ties it to the answer's own reservation)."""
+    settings = get_settings()
+    model = settings.embedding_model
+    estimate = sum(usage.count_tokens(query) for query in queries) + len(queries)
+    reservation = await usage.reserve(
         session,
         user_id=user_id,
         workspace_id=workspace_id,
         operation=UsageOperation.QUERY_EMBEDDING,
         model=model,
-        outcome=outcome,
+        input_tokens=estimate,
+        output_tokens=0,
+        idempotency_key=idempotency_key or f"query_embedding:{uuid.uuid4()}",
+        ttl_seconds=settings.query_reservation_ttl_seconds,
         conversation_id=conversation_id,
+    )
+    await usage.mark_called(session, reservation.id, estimate)
+    try:
+        embedded = await embed_metered(embedder, queries)
+    except EmbeddingError as error:
+        logger.error("Query embedding failed (retryable: %s)", error.retryable)
+        # Refused outright: no work was done. Failed after retries: it may have run.
+        outcome = (
+            usage.Outcome(
+                UsageStatus.FAILED,
+                UsageSource.UNAVAILABLE,
+                error_code="embeddings_unavailable",
+                outcome=UsageOutcome.UNKNOWN,
+            )
+            if error.retryable
+            else usage.Outcome(
+                UsageStatus.FAILED,
+                UsageSource.NONE,
+                error_code="embeddings_unavailable",
+                outcome=UsageOutcome.REJECTED,
+            )
+        )
+        await usage.finalize(session, reservation.id, outcome)
+        raise embeddings_unavailable() from error
+    except BaseException:
+        # Cancelled (the client went away) with the call in flight: outcome unknown.
+        with anyio.CancelScope(shield=True):
+            await usage.finalize(
+                session,
+                reservation.id,
+                usage.Outcome(
+                    UsageStatus.CANCELLED,
+                    UsageSource.UNAVAILABLE,
+                    error_code="cancelled",
+                    outcome=UsageOutcome.UNKNOWN,
+                ),
+            )
+        raise
+    await usage.finalize(
+        session,
+        reservation.id,
+        usage.Outcome(UsageStatus.COMPLETED, UsageSource.PROVIDER, embedded.input_tokens, 0)
+        if embedded.input_tokens is not None
+        else usage.Outcome(UsageStatus.COMPLETED, UsageSource.ESTIMATED, estimate, 0),
     )
     return embedded.vectors
 

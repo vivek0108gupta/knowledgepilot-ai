@@ -16,7 +16,8 @@ from app.core.errors import AppError
 from app.models.usage import UsageOperation
 from app.schemas.conversation import ChatRequest, ChatResponse, MessageOut
 from app.services import chat as service
-from app.services import chat_stream
+from app.services import chat_stream, usage
+from app.services import conversations as conversation_service
 from app.services.llm import ChatModelProvider, get_chat_model
 
 router = APIRouter(tags=["chat"])
@@ -36,6 +37,18 @@ def requested_top_k(body: ChatRequest, settings: Settings) -> int:
     if top_k > settings.chat_max_top_k:
         raise AppError(422, "validation_error", f"top_k can be at most {settings.chat_max_top_k}.")
     return top_k
+
+
+@router.post("/conversations/{conversation_id}/chat/cancel", status_code=status.HTTP_202_ACCEPTED)
+async def cancel_answer(
+    conversation_id: uuid.UUID, user: CurrentUser, session: DbSession
+) -> dict[str, bool]:
+    """Say that you are stopping the answer being written in your conversation. Send it just
+    before closing the stream: the answer is then recorded as cancelled by you rather than as
+    a lost connection. Closing the stream is what stops it; this only labels why."""
+    await conversation_service.get_owned(session, conversation_id, user.id)
+    await session.rollback()
+    return {"cancel_requested": await usage.request_cancel(session, conversation_id, user.id)}
 
 
 @router.post("/conversations/{conversation_id}/chat", status_code=status.HTTP_201_CREATED)

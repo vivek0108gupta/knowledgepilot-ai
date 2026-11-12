@@ -33,7 +33,7 @@ from app.core.config import Settings
 from app.core.errors import AppError
 from app.models.conversation import Message
 from app.models.usage import UsageStatus
-from app.services import chat
+from app.services import chat, usage
 from app.services.embeddings import Embedder
 from app.services.llm import ChatModel, Generation, LLMError, TextDelta
 from app.services.prompts import ANSWER_SCHEMA, ANSWER_SCHEMA_NAME
@@ -159,6 +159,10 @@ class AnswerStream:
                 meter = turn.meter
                 if meter is not None:
                     meter.started(prepared.instructions, prepared.turns, streamed=True)
+                    await usage.mark_called(
+                        self._session, meter.reservation_id, meter.prompt_tokens
+                    )
+                beat = anyio.current_time()
                 try:
                     async with aclosing(
                         self._model.stream(
@@ -172,6 +176,17 @@ class AnswerStream:
                             if isinstance(item, TextDelta):
                                 if meter is not None:
                                     meter.receive(item.text)
+                                    # Keep the reservation alive while text keeps coming.
+                                    if (
+                                        anyio.current_time() - beat
+                                        >= self._settings.usage_heartbeat_seconds
+                                    ):
+                                        beat = anyio.current_time()
+                                        await usage.heartbeat(
+                                            self._session,
+                                            meter.reservation_id,
+                                            self._settings.usage_reservation_ttl_seconds,
+                                        )
                                 text = provisional.feed(reader.feed(item.text))
                                 if text:
                                     yield Delta(text)
@@ -179,11 +194,12 @@ class AnswerStream:
                                 generation = item
                                 if meter is not None:
                                     meter.reported(
-                                        item.input_tokens, item.output_tokens, item.model
+                                        item.input_tokens, item.output_tokens, item.model, item.text
                                     )
                 except LLMError as error:
                     if meter is not None:
                         meter.reported(error.input_tokens, error.output_tokens, error.model)
+                        meter.maybe_executed = error.maybe_executed
                     raise chat.ai_error(error) from error
                 if generation is None:
                     raise chat.ai_error(

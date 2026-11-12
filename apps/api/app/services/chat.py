@@ -319,11 +319,18 @@ async def retrieve(
     document_ids: list[uuid.UUID],
     min_similarity: float,
     conversation_id: uuid.UUID | None = None,
+    idempotency_key: str | None = None,
 ) -> list[Match]:
     """The best `top_k` passages for any of the queries, through the same isolated vector
     query that search uses. All queries are embedded in one request, recorded as usage."""
     vectors = await search_service.embed_query(
-        session, embedder, user_id, workspace_id, queries, conversation_id=conversation_id
+        session,
+        embedder,
+        user_id,
+        workspace_id,
+        queries,
+        conversation_id=conversation_id,
+        idempotency_key=idempotency_key,
     )
 
     best: dict[uuid.UUID, Match] = {}
@@ -389,6 +396,8 @@ async def prepare(
         document_ids,
         min_similarity,
         conversation_id=turn.user_message.conversation_id,
+        # One question embedding per answer attempt.
+        idempotency_key=f"query_embedding:{turn.meter.reservation_id}" if turn.meter else None,
     )
     retrieval: dict[str, Any] = {
         "top_k": top_k,
@@ -464,6 +473,7 @@ async def produce(
     meter = turn.meter
     if meter is not None:
         meter.started(prepared.instructions, prepared.turns)
+        await usage.mark_called(session, meter.reservation_id, meter.prompt_tokens)
     try:
         generation = await model.generate(
             instructions=prepared.instructions,
@@ -474,9 +484,12 @@ async def produce(
     except LLMError as error:
         if meter is not None:
             meter.reported(error.input_tokens, error.output_tokens, error.model)
+            meter.maybe_executed = error.maybe_executed
         raise ai_error(error) from error
     if meter is not None:
-        meter.reported(generation.input_tokens, generation.output_tokens, generation.model)
+        meter.reported(
+            generation.input_tokens, generation.output_tokens, generation.model, generation.text
+        )
     return conclude(turn.user_message.conversation_id, prepared, generation)
 
 

@@ -79,10 +79,14 @@ class LLMError(Exception):
         input_tokens: int | None = None,
         output_tokens: int | None = None,
         model: str | None = None,
+        maybe_executed: bool = True,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.retryable = retryable
+        # False when the provider is known not to have run the request (it refused it with a
+        # rate limit); True when it may have (a timeout, a lost connection, a server error).
+        self.maybe_executed = maybe_executed
         # What the provider reported using, when it reported anything despite the failure
         # (an answer cut off by the output limit is still billed).
         self.input_tokens = input_tokens
@@ -177,7 +181,9 @@ class OpenAIResponsesModel:
             logger.error(
                 "Model request failed after %d attempts: %s", attempt, type(error).__name__
             )
-            raise unavailable() from error
+            raise unavailable(
+                maybe_executed=not isinstance(error, openai.RateLimitError)
+            ) from error
         delay = backoff_delay(attempt, self._base_delay, error)
         logger.warning(
             "Model request failed (%s); attempt %d of %d, retrying in %.1fs",
@@ -317,8 +323,13 @@ class OpenAIResponsesModel:
         )
 
 
-def unavailable() -> LLMError:
-    return LLMError("The AI service is busy or unreachable.", code="unavailable", retryable=True)
+def unavailable(*, maybe_executed: bool = True) -> LLMError:
+    return LLMError(
+        "The AI service is busy or unreachable.",
+        code="unavailable",
+        retryable=True,
+        maybe_executed=maybe_executed,
+    )
 
 
 def ai_not_configured() -> AppError:

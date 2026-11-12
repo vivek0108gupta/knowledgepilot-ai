@@ -66,6 +66,15 @@ export const usageSummarySchema = z.object({
   ),
   estimated_records: z.number(),
   unavailable_records: z.number(),
+  accounting: z
+    .object({
+      provider_reported_tokens: z.number(),
+      estimated_tokens: z.number(),
+      held_tokens: z.number(),
+      not_charged_records: z.number(),
+    })
+    .optional(),
+  outcomes: z.record(z.string(), z.number()).optional(),
   allowance: workspaceAllowanceSchema,
   my_allowance: userAllowanceSchema,
 });
@@ -97,8 +106,29 @@ export type UsageHistory = z.infer<typeof usageHistorySchema>;
 
 export const HISTORY_PAGE_SIZE = 20;
 
+export const alertSchema = z.object({
+  id: z.uuid(),
+  kind: z.enum(["workspace_tokens", "workspace_cost", "user_daily_tokens"]),
+  threshold_percent: z.number(),
+  period_start: z.string(),
+  used: decimal,
+  limit_value: decimal,
+  created_at: z.string(),
+});
+export type UsageAlert = z.infer<typeof alertSchema>;
+
+export const ALERT_LABELS: Record<UsageAlert["kind"], string> = {
+  workspace_tokens: "this workspace's monthly tokens",
+  workspace_cost: "this workspace's monthly spending",
+  user_daily_tokens: "your daily tokens",
+};
+
+export const getUsageAlerts = (workspaceId: string, signal?: AbortSignal) =>
+  apiFetch(`/workspaces/${workspaceId}/usage/alerts`, z.array(alertSchema), { signal });
+
 export const usageKeys = {
   summary: (workspaceId: string) => ["workspaces", workspaceId, "usage"] as const,
+  alerts: (workspaceId: string) => ["workspaces", workspaceId, "usage", "alerts"] as const,
   history: (workspaceId: string, offset: number, operation: Operation | "") =>
     ["workspaces", workspaceId, "usage", "history", offset, operation] as const,
 };

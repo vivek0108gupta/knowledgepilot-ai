@@ -27,6 +27,7 @@ const mocks = vi.hoisted(() => ({
   deleteConversation: vi.fn(),
   listMessages: vi.fn(),
   streamQuestion: vi.fn(),
+  requestCancel: vi.fn(),
   getDownload: vi.fn(),
   startDownload: vi.fn(),
 }));
@@ -60,6 +61,7 @@ vi.mock("@/lib/conversations", async (importOriginal) => ({
 vi.mock("@/lib/chat-stream", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/lib/chat-stream")>()),
   streamQuestion: mocks.streamQuestion,
+  requestCancel: mocks.requestCancel,
 }));
 
 function conversation(id: string, title: string, workspaceId = WORKSPACE): Conversation {
@@ -875,9 +877,12 @@ describe("streaming answers", () => {
     await stream.start(QUESTION);
     await stream.delta("Customers can");
 
+    mocks.requestCancel.mockResolvedValue(undefined);
     await user.click(screen.getByRole("button", { name: "Stop" }));
 
-    expect(stream.signal?.aborted).toBe(true);
+    // The server is told it was the person's choice, then the stream is closed.
+    expect(mocks.requestCancel).toHaveBeenCalledWith(FIRST);
+    await vi.waitFor(() => expect(stream.signal?.aborted).toBe(true));
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("You stopped this answer. Your question was kept.");
     expect(screen.queryByText("Customers can")).not.toBeInTheDocument();

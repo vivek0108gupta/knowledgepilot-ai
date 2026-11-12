@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { ApiError, configureApiAuth } from "./api";
-import { readEvents, streamQuestion, wasStopped } from "./chat-stream";
+import { readEvents, requestCancel, streamQuestion, wasStopped } from "./chat-stream";
 
 const CONVERSATION = "11111111-1111-4111-8111-111111111111";
 const QUESTION_ID = "00000000-0000-4000-8000-000000000001";
@@ -277,5 +277,36 @@ describe("streaming a question", () => {
 
     expect(wasStopped(error)).toBe(true);
     expect(wasStopped(new ApiError(0, "network_error", "x"))).toBe(false);
+  });
+});
+
+describe("asking to cancel", () => {
+  test("posts to the conversation's cancel endpoint with the session token", async () => {
+    configureApiAuth({ getAccessToken: async () => "token-123", onUnauthorized: vi.fn() });
+    const calls = stubFetch(() => Response.json({ cancel_requested: true }, { status: 202 }));
+
+    await requestCancel(CONVERSATION);
+
+    expect(calls[0]!.url).toBe(`http://localhost:8000/api/v1/conversations/${CONVERSATION}/chat/cancel`);
+    expect(calls[0]!.init.method).toBe("POST");
+    expect(calls[0]!.init.headers).toMatchObject({ Authorization: "Bearer token-123" });
+  });
+
+  test("never rejects, and never holds Stop up for long", async () => {
+    vi.stubGlobal("fetch", async () => {
+      throw new TypeError("Failed to fetch");
+    });
+    await expect(requestCancel(CONVERSATION)).resolves.toBeUndefined();
+
+    vi.stubGlobal(
+      "fetch",
+      (_url: string, init: RequestInit) =>
+        new Promise((_resolve, reject) =>
+          init.signal?.addEventListener("abort", () => reject(new Error("aborted"))),
+        ),
+    );
+    const started = Date.now();
+    await requestCancel(CONVERSATION, 50);
+    expect(Date.now() - started).toBeLessThan(1000);
   });
 });

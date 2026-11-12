@@ -69,8 +69,20 @@ class UsageSummary(BaseModel):
     # reserved maximum, rather than reported by the provider.
     estimated_records: int
     unavailable_records: int
+    # How the charged tokens break down: reported by the provider, estimated here, or held
+    # as an upper bound because the outcome is unknown. They add up to `totals.tokens`.
+    accounting: "ChargeBreakdown"
+    # Records by what happened at the provider (executed_with_usage, unknown, ...).
+    outcomes: dict[str, int]
     allowance: WorkspaceAllowance
     my_allowance: UserAllowance
+
+
+class ChargeBreakdown(BaseModel):
+    provider_reported_tokens: int
+    estimated_tokens: int
+    held_tokens: int
+    not_charged_records: int
 
 
 class UsageEventOut(BaseModel):
@@ -84,6 +96,7 @@ class UsageEventOut(BaseModel):
     model: str
     status: UsageStatus
     usage_source: UsageSource | None
+    outcome: str | None = None
     input_tokens: int | None
     output_tokens: int | None
     estimated_input_tokens: int | None
@@ -126,6 +139,7 @@ class QuotaPolicyOut(BaseModel):
     workspace_monthly_token_limit: int | None
     workspace_monthly_cost_limit: Decimal | None
     workspace_max_concurrent_operations: int | None
+    alert_threshold_percent: int
     can_edit: bool
     allowance: WorkspaceAllowance
 
@@ -141,9 +155,57 @@ class QuotaPolicyUpdate(BaseModel):
         default=None, ge=0, le=Decimal("1000000000"), max_digits=14, decimal_places=4
     )
     max_concurrent_operations: int | None = Field(default=None, ge=1, le=10_000)
+    alert_threshold_percent: int | None = Field(default=None, ge=1, le=100)
 
 
 class MyUsage(BaseModel):
     allowance: UserAllowance
     currency: str
     today: UsageTotals
+    # Your daily-usage warnings today.
+    alerts: list["AlertOut"] = []
+
+
+class MemberQuotaUpdate(BaseModel):
+    """A member's own limits in this workspace. Null: no limit of their own."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    monthly_token_limit: int | None = Field(default=None, ge=0, le=10**15)
+    daily_question_limit: int | None = Field(default=None, ge=0, le=1_000_000)
+
+
+class MemberQuotaOut(BaseModel):
+    user_id: uuid.UUID
+    monthly_token_limit: int | None
+    daily_question_limit: int | None
+    monthly_tokens_used: int
+    updated_at: datetime | None
+
+
+class AlertOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    kind: str
+    threshold_percent: int
+    period_start: datetime
+    used: Decimal
+    limit_value: Decimal
+    created_at: datetime
+
+
+class AuditEventOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    actor_id: uuid.UUID
+    action: str
+    target_user_id: uuid.UUID | None
+    details: dict
+    created_at: datetime
+
+
+class AuditPage(BaseModel):
+    items: list[AuditEventOut]
+    total: int

@@ -270,6 +270,10 @@ describe("limit refusals", () => {
     ["user_quota_exceeded", "You have reached your daily AI usage limit. It resets at midnight UTC."],
     ["workspace_quota_exceeded", "This workspace has reached its monthly spending limit."],
     ["concurrent_generation_limit", "You already have 3 answers being written. Wait for one to finish."],
+    [
+      "member_quota_exceeded",
+      "You have reached the monthly AI usage limit the owner set for you in this workspace.",
+    ],
     ["usage_unavailable", "Usage limits could not be checked, so the request was not run."],
   ])("%s shows the API's explanation and is not offered as a retry of a kept question", (code, message) => {
     const error = new ApiError(code === "usage_unavailable" ? 503 : 429, code, message);

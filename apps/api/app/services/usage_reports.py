@@ -18,10 +18,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.errors import AppError
-from app.models.usage import GENERATIONS, UsageEvent, UsageSource, WorkspaceQuotaPolicy
-from app.models.workspace import WorkspaceRole
+from app.models.usage import (
+    GENERATIONS,
+    AlertKind,
+    AuditEvent,
+    UsageAlert,
+    UsageEvent,
+    UsageSource,
+    WorkspaceMemberQuota,
+    WorkspaceQuotaPolicy,
+)
+from app.models.workspace import WorkspaceMember, WorkspaceRole
 from app.schemas.usage import (
+    AlertOut,
+    AuditEventOut,
+    AuditPage,
+    ChargeBreakdown,
     DailyUsage,
+    MemberQuotaOut,
+    MemberQuotaUpdate,
     ModelUsage,
     MyUsage,
     OperationUsage,
@@ -106,9 +121,34 @@ async def summary(
                 func.count(count),
                 func.count().filter(UsageEvent.usage_source == UsageSource.ESTIMATED.value),
                 func.count().filter(UsageEvent.usage_source == UsageSource.UNAVAILABLE.value),
+                func.coalesce(
+                    func.sum(tokens).filter(UsageEvent.usage_source == UsageSource.PROVIDER.value),
+                    0,
+                ),
+                func.coalesce(
+                    func.sum(tokens).filter(UsageEvent.usage_source == UsageSource.ESTIMATED.value),
+                    0,
+                ),
+                # Held: unknown outcomes, and open reservations (not yet known either).
+                func.coalesce(
+                    func.sum(tokens).filter(
+                        (UsageEvent.usage_source == UsageSource.UNAVAILABLE.value)
+                        | UsageEvent.usage_source.is_(None)
+                    ),
+                    0,
+                ),
+                func.count().filter(UsageEvent.usage_source == UsageSource.NONE.value),
             ).where(*scope)
         )
     ).one()
+    outcomes = {
+        (outcome or "in_progress"): count
+        for outcome, count in (
+            await session.execute(
+                select(UsageEvent.outcome, func.count()).where(*scope).group_by(UsageEvent.outcome)
+            )
+        ).all()
+    }
     by_operation = (
         await session.execute(
             select(UsageEvent.operation, func.sum(tokens), func.sum(cost), func.count(count))
@@ -165,6 +205,13 @@ async def summary(
         ],
         estimated_records=int(total[3] or 0),
         unavailable_records=int(total[4] or 0),
+        accounting=ChargeBreakdown(
+            provider_reported_tokens=int(total[5]),
+            estimated_tokens=int(total[6]),
+            held_tokens=int(total[7]),
+            not_charged_records=int(total[8] or 0),
+        ),
+        outcomes={str(key): int(value) for key, value in outcomes.items()},
         allowance=await workspace_allowance(session, workspace_id, now),
         my_allowance=await user_allowance(session, user_id, now),
     )
@@ -232,6 +279,8 @@ async def quota_policy(
         workspace_monthly_token_limit=own.monthly_token_limit if own else None,
         workspace_monthly_cost_limit=own.monthly_cost_limit if own else None,
         workspace_max_concurrent_operations=own.max_concurrent_operations if own else None,
+        alert_threshold_percent=(own.alert_threshold_percent if own else None)
+        or get_settings().usage_alert_threshold_percent,
         can_edit=access.role == WorkspaceRole.OWNER,
         allowance=await workspace_allowance(session, workspace_id, now),
     )
@@ -252,6 +301,7 @@ async def update_quota_policy(
         "monthly_token_limit": system.workspace_monthly_tokens,
         "monthly_cost_limit": system.workspace_monthly_cost,
         "max_concurrent_operations": system.workspace_concurrent_operations,
+        "alert_threshold_percent": 100,
     }
     for field, value in changes.items():
         if value is not None and value > ceilings[field]:
@@ -266,10 +316,12 @@ async def update_quota_policy(
     if policy is None:
         policy = WorkspaceQuotaPolicy(workspace_id=workspace_id, updated_by=user_id)
         session.add(policy)
+    before = {field: _plain(getattr(policy, field, None)) for field in changes}
     for field, value in changes.items():
         setattr(policy, field, value)
     policy.updated_by = user_id
     policy.updated_at = datetime.now(UTC)
+    audit(session, workspace_id, user_id, "quota_policy.updated", before, changes)
     await session.commit()
     return await quota_policy(session, workspace_id, user_id)
 
@@ -290,6 +342,198 @@ async def my_usage(session: AsyncSession, user_id: uuid.UUID) -> MyUsage:
         allowance=await user_allowance(session, user_id, now),
         currency=get_pricing().currency,
         today=UsageTotals(**_totals(row[0], row[1], row[2])),
+        alerts=await my_alerts(session, user_id),
     )
     await session.rollback()
     return result
+
+
+# --- Audit log ----------------------------------------------------------------------------
+
+
+def _plain(value: object) -> object:
+    return str(value) if isinstance(value, Decimal) else value
+
+
+def audit(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    actor_id: uuid.UUID,
+    action: str,
+    before: dict,
+    after: dict,
+    target_user_id: uuid.UUID | None = None,
+) -> None:
+    """Append a policy change to the audit log, in the caller's transaction: the change and
+    its record are committed together or not at all."""
+    session.add(
+        AuditEvent(
+            workspace_id=workspace_id,
+            actor_id=actor_id,
+            action=action,
+            target_user_id=target_user_id,
+            details={
+                "before": {key: _plain(value) for key, value in before.items()},
+                "after": {key: _plain(value) for key, value in after.items()},
+            },
+        )
+    )
+
+
+async def audit_log(
+    session: AsyncSession, workspace_id: uuid.UUID, user_id: uuid.UUID, *, limit: int, offset: int
+) -> AuditPage:
+    """Policy changes in a workspace, newest first. Owners and admins."""
+    access = await workspace_service.get_access(session, workspace_id, user_id)
+    workspace_service.require_role(access, *MANAGERS)
+    scope = AuditEvent.workspace_id == workspace_id
+    total = await session.scalar(select(func.count()).select_from(AuditEvent).where(scope))
+    rows = await session.scalars(
+        select(AuditEvent)
+        .where(scope)
+        .order_by(AuditEvent.created_at.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    result = AuditPage(
+        items=[AuditEventOut.model_validate(row) for row in rows], total=int(total or 0)
+    )
+    await session.rollback()
+    return result
+
+
+# --- Member quotas ------------------------------------------------------------------------
+
+
+async def member_quotas(
+    session: AsyncSession, workspace_id: uuid.UUID, user_id: uuid.UUID
+) -> list[MemberQuotaOut]:
+    """Every member's own limits and this month's use. Owners and admins."""
+    access = await workspace_service.get_access(session, workspace_id, user_id)
+    workspace_service.require_role(access, *MANAGERS)
+    now = datetime.now(UTC)
+    used = dict(
+        (
+            await session.execute(
+                select(UsageEvent.user_id, func.sum(UsageEvent.charged_tokens))
+                .where(
+                    UsageEvent.workspace_id == workspace_id,
+                    UsageEvent.created_at >= usage.month_start(now),
+                )
+                .group_by(UsageEvent.user_id)
+            )
+        ).all()
+    )
+    quotas = {
+        quota.user_id: quota
+        for quota in await session.scalars(
+            select(WorkspaceMemberQuota).where(WorkspaceMemberQuota.workspace_id == workspace_id)
+        )
+    }
+    members = await session.scalars(
+        select(WorkspaceMember.user_id).where(WorkspaceMember.workspace_id == workspace_id)
+    )
+    result = [
+        MemberQuotaOut(
+            user_id=member,
+            monthly_token_limit=quotas[member].monthly_token_limit if member in quotas else None,
+            daily_question_limit=quotas[member].daily_question_limit if member in quotas else None,
+            monthly_tokens_used=int(used.get(member) or 0),
+            updated_at=quotas[member].updated_at if member in quotas else None,
+        )
+        for member in members
+    ]
+    await session.rollback()
+    return result
+
+
+async def update_member_quota(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    user_id: uuid.UUID,
+    member_id: uuid.UUID,
+    body: MemberQuotaUpdate,
+) -> MemberQuotaOut:
+    """Set a member's own limits in this workspace. Owners only, for members of this
+    workspace only, and never above the workspace's or the system's limits."""
+    access = await workspace_service.get_access(session, workspace_id, user_id, lock=True)
+    workspace_service.require_role(access, WorkspaceRole.OWNER)
+    is_member = await session.scalar(
+        select(WorkspaceMember.id).where(
+            WorkspaceMember.workspace_id == workspace_id, WorkspaceMember.user_id == member_id
+        )
+    )
+    if is_member is None:
+        await session.rollback()
+        raise AppError(404, "member_not_found", "That user is not a member of this workspace.")
+    limits = await usage.effective_limits(session, workspace_id)
+    changes = body.model_dump(exclude_unset=True)
+    ceilings = {
+        "monthly_token_limit": limits.workspace_monthly_tokens,
+        "daily_question_limit": limits.user_daily_chats,
+    }
+    for field, value in changes.items():
+        if value is not None and value > ceilings[field]:
+            await session.rollback()
+            raise AppError(
+                422,
+                "quota_above_workspace_limit",
+                f"{field} can be at most {ceilings[field]}: a member's limit can only be "
+                "stricter than the workspace's.",
+            )
+    quota = await session.get(WorkspaceMemberQuota, (workspace_id, member_id))
+    if quota is None:
+        quota = WorkspaceMemberQuota(
+            workspace_id=workspace_id, user_id=member_id, updated_by=user_id
+        )
+        session.add(quota)
+    before = {field: getattr(quota, field, None) for field in changes}
+    for field, value in changes.items():
+        setattr(quota, field, value)
+    quota.updated_by = user_id
+    quota.updated_at = datetime.now(UTC)
+    audit(session, workspace_id, user_id, "member_quota.updated", before, changes, member_id)
+    await session.commit()
+    return next(
+        q for q in await member_quotas(session, workspace_id, user_id) if q.user_id == member_id
+    )
+
+
+# --- Alerts -------------------------------------------------------------------------------
+
+
+async def workspace_alerts(
+    session: AsyncSession, workspace_id: uuid.UUID, user_id: uuid.UUID
+) -> list[AlertOut]:
+    """This period's alerts for a workspace (every member is subject to its limits), and the
+    caller's own daily alerts."""
+    await workspace_service.get_access(session, workspace_id, user_id)
+    now = datetime.now(UTC)
+    rows = await session.scalars(
+        select(UsageAlert)
+        .where(
+            (
+                (UsageAlert.workspace_id == workspace_id)
+                & (UsageAlert.period_start >= usage.month_start(now))
+            )
+            | (
+                (UsageAlert.user_id == user_id)
+                & (UsageAlert.kind == AlertKind.USER_DAILY_TOKENS.value)
+                & (UsageAlert.period_start >= usage.day_start(now))
+            )
+        )
+        .order_by(UsageAlert.created_at.desc())
+    )
+    result = [AlertOut.model_validate(row) for row in rows]
+    await session.rollback()
+    return result
+
+
+async def my_alerts(session: AsyncSession, user_id: uuid.UUID) -> list[AlertOut]:
+    now = datetime.now(UTC)
+    rows = await session.scalars(
+        select(UsageAlert)
+        .where(UsageAlert.user_id == user_id, UsageAlert.period_start >= usage.day_start(now))
+        .order_by(UsageAlert.created_at.desc())
+    )
+    return [AlertOut.model_validate(row) for row in rows]

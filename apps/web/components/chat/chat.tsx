@@ -18,7 +18,7 @@ import { TextField } from "@/components/ui/field";
 import { Modal } from "@/components/ui/modal";
 import { ApiError, errorMessage } from "@/lib/api";
 import { cn } from "@/lib/cn";
-import { streamQuestion, wasStopped } from "@/lib/chat-stream";
+import { requestCancel, streamQuestion, wasStopped } from "@/lib/chat-stream";
 import {
   chatErrorMessage,
   chatPath,
@@ -768,7 +768,10 @@ function ChatArea({ workspaceId, conversationId }: { workspaceId: string; conver
   }
 
   function stop() {
-    controller.current?.abort();
+    const running = controller.current;
+    if (!running) return;
+    // Label the stop as the person's choice first, then close the stream.
+    void requestCancel(conversationId).finally(() => running.abort());
   }
 
   const ordered = messages.data ? [...messages.data.pages].reverse().flatMap((page) => page.items) : [];

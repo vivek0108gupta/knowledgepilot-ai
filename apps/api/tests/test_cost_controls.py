@@ -538,27 +538,46 @@ class TestChatMetering:
         await ask(db_client, library["conversation"], library["owner"], "refund policy")
 
         (row,) = await generation_rows(db_engine)
-        # A whole response arrived without counts: nothing is known, so the reservation is charged.
-        assert row["usage_source"] == "unavailable"
-        assert row["input_tokens"] is None
-        assert row["charged_tokens"] == row["reserved_input_tokens"] + row["reserved_output_tokens"]
+        # Phase 5.5: a whole response arrived without counts. The prompt sent and the text
+        # received are known, so they are counted here and labelled an estimate, never as
+        # provider usage, and never the inflated reservation.
+        assert (row["usage_source"], row["outcome"]) == ("estimated", "executed_without_usage")
+        assert row["input_tokens"] is None and row["total_tokens"] is None
+        assert row["estimated_input_tokens"] == row["prompt_tokens_sent"] > 0
+        assert row["estimated_output_tokens"] > 0
+        assert (
+            row["charged_tokens"] == row["estimated_input_tokens"] + row["estimated_output_tokens"]
+        )
+        assert row["charged_tokens"] < row["reserved_input_tokens"] + row["reserved_output_tokens"]
 
 
 class TestFailureMetering:
     @pytest.mark.parametrize(
-        ("error", "source"),
+        ("error", "source", "outcome"),
         [
-            (LLMError("x", code="unavailable", retryable=True), "unavailable"),
-            (LLMError("x", code="misconfigured", retryable=False), "none"),
-            (LLMError("x", code="rejected", retryable=False), "none"),
+            (LLMError("x", code="unavailable", retryable=True), "unavailable", "unknown"),
+            (
+                LLMError("x", code="unavailable", retryable=True, maybe_executed=False),
+                "none",
+                "rejected",
+            ),
+            (LLMError("x", code="misconfigured", retryable=False), "none", "rejected"),
+            (LLMError("x", code="rejected", retryable=False), "none", "rejected"),
             (
                 LLMError(
                     "x", code="too_long", retryable=False, input_tokens=900, output_tokens=1000
                 ),
                 "provider",
+                "executed_with_usage",
             ),
         ],
-        ids=["timeout or rate limit", "authentication", "rejected", "cut off by the output limit"],
+        ids=[
+            "timeout: may have run",
+            "rate limited: did not run",
+            "authentication",
+            "rejected",
+            "cut off by the output limit",
+        ],
     )
     async def test_a_failed_answer_records_what_is_known(
         self,
@@ -568,13 +587,15 @@ class TestFailureMetering:
         library: dict,
         error: LLMError,
         source: str,
+        outcome: str,
     ) -> None:
         chat_model.fail = error
 
         await ask(db_client, library["conversation"], library["owner"], "refund policy")
 
         (row,) = await generation_rows(db_engine)
-        assert (row["status"], row["usage_source"]) == ("failed", source)
+        assert (row["status"], row["usage_source"], row["outcome"]) == ("failed", source, outcome)
+        assert row["provider_called_at"] is not None
         assert row["error_code"].startswith("ai_")
         if source == "provider":
             assert (row["input_tokens"], row["output_tokens"], row["charged_tokens"]) == (
@@ -585,9 +606,14 @@ class TestFailureMetering:
         if source == "none":
             assert row["charged_tokens"] == 0
         if source == "unavailable":
+            # Phase 5.5: unknown, so an upper bound is held: the prompt actually sent plus
+            # the most output it could have produced. Never written as provider usage.
+            assert row["input_tokens"] is None and row["estimated_input_tokens"] is None
             assert (
-                row["charged_tokens"]
-                == row["reserved_input_tokens"] + row["reserved_output_tokens"]
+                row["charged_tokens"] == row["prompt_tokens_sent"] + row["reserved_output_tokens"]
+            )
+            assert (
+                row["charged_tokens"] < row["reserved_input_tokens"] + row["reserved_output_tokens"]
             )
 
     async def test_a_stream_that_fails_part_way_records_an_estimate(
@@ -1126,18 +1152,37 @@ class TestQuotas:
                 ),
                 {"w": uuid.UUID(library["workspace"]), "u": library["owner"]},
             )
+            # Another, whose provider call had begun (its prompt of 300 tokens was sent).
+            await connection.execute(
+                text(
+                    "INSERT INTO usage_events (workspace_id, user_id, operation, provider, model, "
+                    "status, reserved_input_tokens, reserved_output_tokens, charged_tokens, "
+                    "charged_cost, currency, pricing_version, idempotency_key, created_at, "
+                    "expires_at, provider_called_at, prompt_tokens_sent) "
+                    "VALUES (:w, :u, 'chat', 'openai', 'fake-model', 'reserved', 900, 100, "
+                    "1000, 0, 'USD', 'v', 'crashed-mid-call', now() - interval '20 minutes', "
+                    "now() - interval '10 minutes', now() - interval '19 minutes', 300)"
+                ),
+                {"w": uuid.UUID(library["workspace"]), "u": library["owner"]},
+            )
 
         response = await ask(db_client, library["conversation"], library["owner"], "refund policy")
 
         assert response.status_code == 201
         (crashed,) = await usage_rows(db_engine, "idempotency_key = 'crashed'")
-        assert (crashed["status"], crashed["usage_source"], crashed["error_code"]) == (
+        assert (crashed["status"], crashed["outcome"], crashed["error_code"]) == (
             "expired",
-            "unavailable",
+            "abandoned",
             "reservation_expired",
         )
-        # Its reserved amount stays charged: the provider may have done the work.
-        assert crashed["charged_tokens"] == 1000
+        assert crashed["expired_at"] is not None
+        # Phase 5.5: never sent to the provider, so nothing is charged: a crash before the
+        # call no longer consumes quota for the rest of the period.
+        assert (crashed["usage_source"], crashed["charged_tokens"]) == ("none", 0)
+        (mid_call,) = await usage_rows(db_engine, "idempotency_key = 'crashed-mid-call'")
+        # Sent, outcome unknown: an upper bound is held (prompt sent + maximum output).
+        assert (mid_call["usage_source"], mid_call["charged_tokens"]) == ("unavailable", 400)
+        assert mid_call["input_tokens"] is None
 
     async def test_search_is_refused_once_the_allowance_is_spent(
         self,

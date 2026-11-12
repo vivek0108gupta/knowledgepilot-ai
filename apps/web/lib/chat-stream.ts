@@ -180,6 +180,27 @@ export async function streamQuestion(
   throw interrupted();
 }
 
+/**
+ * Tells the server the person is stopping the answer, so it is recorded as their choice rather
+ * than a lost connection. Closing the stream is what stops it; this only labels why. Never
+ * rejects, and gives up after `timeoutMs` so Stop is never held up.
+ */
+export async function requestCancel(conversationId: string, timeoutMs = 1500): Promise<void> {
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), timeoutMs);
+  try {
+    await fetch(`${API_V1}/conversations/${conversationId}/chat/cancel`, {
+      method: "POST",
+      headers: { Accept: "application/json", ...(await authHeaders()) },
+      signal: abort.signal,
+    });
+  } catch {
+    // Labelling is best effort: the stream is closed either way.
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** Whether a rejection from `streamQuestion` means the person stopped the answer. */
 export function wasStopped(error: unknown): boolean {
   return error instanceof DOMException && error.name === "AbortError";
