@@ -19,12 +19,19 @@ expires, so a crash cannot block a conversation for ever.
 If answering fails, the question stays stored and no answer is invented. Sending the same
 `client_message_id` again retries the answer for that stored question; once an answer exists,
 it is returned instead of a second one.
+
+Cost controls (usage.py, rate_limits.py): `admit` applies the chat rate limits before
+anything else; `begin` reserves the answer's maximum usage in the same transaction that
+stores the question, so a question over a limit is refused and not stored. Every way an
+answer ends finalises that reservation exactly once (`save` on success, `release` on
+failure). A replayed answer makes no reservation and no provider call.
 """
 
 import logging
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import lru_cache
 from typing import Any
 
 from sqlalchemy import select, update
@@ -34,12 +41,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings, get_settings
 from app.core.errors import AppError
 from app.models.conversation import Conversation, ConversationStatus, Message, MessageRole
-from app.services import chat_history
+from app.models.usage import UsageOperation, UsageStatus
+from app.services import chat_history, rate_limits, usage
 from app.services import conversations as conversation_service
 from app.services import search as search_service
 from app.services.citations import FinalAnswer, InvalidAnswer, finalize
 from app.services.context_builder import Context, build_context
-from app.services.embeddings import Embedder, EmbedderProvider, EmbeddingError
+from app.services.embeddings import Embedder, EmbedderProvider
 from app.services.llm import ChatModel, ChatModelProvider, Generation, LLMError, Turn
 from app.services.prompts import (
     ANSWER_SCHEMA,
@@ -82,6 +90,8 @@ class PendingAnswer:
     workspace_id: uuid.UUID
     user_message: Message
     reply: Message | None
+    # Tracks the reserved model call; None when replaying a stored answer.
+    meter: usage.GenerationMeter | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,14 +160,53 @@ async def find_reply(
     )
 
 
+async def admit(session: AsyncSession, conversation_id: uuid.UUID, user_id: uuid.UUID) -> None:
+    """Apply the chat rate limits, per user and per the conversation's workspace. The
+    workspace is the one the caller's own conversation belongs to: 404 otherwise, before
+    anything is counted against it."""
+    settings = get_settings()
+    conversation = await conversation_service.get_owned(session, conversation_id, user_id)
+    workspace_id = conversation.workspace_id
+    await session.rollback()
+    await rate_limits.hit(session, rate_limits.chat_per_user(settings), user_id)
+    await rate_limits.hit(session, rate_limits.chat_per_workspace(settings), workspace_id)
+
+
+@lru_cache
+def instruction_tokens() -> int:
+    return usage.count_tokens(system_prompt("0" * 16))
+
+
+def reservation_size(question: str, settings: Settings) -> tuple[int, int]:
+    """The most input and output one answer may use: the question, the full context and
+    history budgets and the instructions in, at most CHAT_MAX_OUTPUT_TOKENS out."""
+    input_tokens = (
+        usage.count_tokens(question)
+        + settings.chat_context_tokens
+        + settings.chat_history_tokens
+        + instruction_tokens()
+        + usage.PROMPT_OVERHEAD_TOKENS
+    )
+    if input_tokens > settings.chat_max_input_tokens:
+        raise AppError(
+            422,
+            "input_too_large",
+            "This question, with the context it needs, is larger than an answer may use. "
+            "Shorten the question.",
+        )
+    return input_tokens, settings.chat_max_output_tokens
+
+
 async def begin(
     session: AsyncSession,
     conversation_id: uuid.UUID,
     user_id: uuid.UUID,
     question: str,
     client_message_id: uuid.UUID | None,
+    operation: UsageOperation = UsageOperation.CHAT,
 ) -> PendingAnswer:
-    """Store the question (or find it, for a retry) and take the conversation's lease."""
+    """Store the question (or find it, for a retry), take the conversation's lease and
+    reserve the answer's usage, all in one transaction."""
     conversation = await conversation_service.get_owned(
         session, conversation_id, user_id, lock=True
     )
@@ -215,6 +264,31 @@ async def begin(
     conversation.generating_message_id = user_message.id
     conversation.generating_since = now
     conversation.updated_at = now
+    settings = get_settings()
+    input_tokens, output_tokens = reservation_size(question, settings)
+    try:
+        await session.flush()
+    except IntegrityError as error:
+        await session.rollback()
+        raise AppError(
+            409, "message_conflict", "The message could not be saved. Try again."
+        ) from error
+    # Joins this transaction: if a limit refuses it, the question is not stored either.
+    reservation = await usage.reserve(
+        session,
+        user_id=user_id,
+        workspace_id=workspace_id,
+        operation=operation,
+        model=settings.openai_chat_model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        # One reservation per attempt: the lease's start time is unique to this attempt.
+        idempotency_key=f"{operation.value}:{user_message.id}:{now.isoformat()}",
+        ttl_seconds=settings.usage_reservation_ttl_seconds,
+        conversation_id=conversation.id,
+        commit=False,
+        now=now,
+    )
     try:
         await session.commit()
     except IntegrityError as error:
@@ -232,7 +306,7 @@ async def begin(
         conversation_id,
         len(question),
     )
-    return PendingAnswer(workspace_id, user_message, None)
+    return PendingAnswer(workspace_id, user_message, None, usage.GenerationMeter(reservation.id))
 
 
 async def retrieve(
@@ -244,14 +318,13 @@ async def retrieve(
     top_k: int,
     document_ids: list[uuid.UUID],
     min_similarity: float,
+    conversation_id: uuid.UUID | None = None,
 ) -> list[Match]:
     """The best `top_k` passages for any of the queries, through the same isolated vector
-    query that search uses. All queries are embedded in one request."""
-    try:
-        vectors = await embedder.embed(queries)
-    except EmbeddingError as error:
-        logger.error("Question embedding failed (retryable: %s)", error.retryable)
-        raise search_service.embeddings_unavailable() from error
+    query that search uses. All queries are embedded in one request, recorded as usage."""
+    vectors = await search_service.embed_query(
+        session, embedder, user_id, workspace_id, queries, conversation_id=conversation_id
+    )
 
     best: dict[uuid.UUID, Match] = {}
     for vector in vectors:
@@ -315,6 +388,7 @@ async def prepare(
         top_k,
         document_ids,
         min_similarity,
+        conversation_id=turn.user_message.conversation_id,
     )
     retrieval: dict[str, Any] = {
         "top_k": top_k,
@@ -387,6 +461,9 @@ async def produce(
     if prepared.context is None:
         # Nothing relevant: answer honestly without spending a model call.
         return no_evidence_answer(prepared.retrieval)
+    meter = turn.meter
+    if meter is not None:
+        meter.started(prepared.instructions, prepared.turns)
     try:
         generation = await model.generate(
             instructions=prepared.instructions,
@@ -395,7 +472,11 @@ async def produce(
             schema_name=ANSWER_SCHEMA_NAME,
         )
     except LLMError as error:
+        if meter is not None:
+            meter.reported(error.input_tokens, error.output_tokens, error.model)
         raise ai_error(error) from error
+    if meter is not None:
+        meter.reported(generation.input_tokens, generation.output_tokens, generation.model)
     return conclude(turn.user_message.conversation_id, prepared, generation)
 
 
@@ -406,8 +487,11 @@ async def save(
     user_message: Message,
     answer: Answer,
     message_id: uuid.UUID | None = None,
+    meter: usage.GenerationMeter | None = None,
 ) -> Message:
-    """Store the answer and release the lease, in one transaction."""
+    """Store the answer, release the lease and record the answer's usage, in one
+    transaction: an answer is never stored without its usage, nor usage completed without
+    its answer."""
     conversation = await conversation_service.get_owned(
         session, conversation_id, user_id, lock=True
     )
@@ -449,6 +533,14 @@ async def save(
     conversation.generating_since = None
     conversation.updated_at = datetime.now(UTC)
     try:
+        if meter is not None:
+            await session.flush()
+            await usage.finalize(
+                session,
+                meter.reservation_id,
+                meter.outcome(UsageStatus.COMPLETED, message_id=message.id),
+                commit=False,
+            )
         await session.commit()
     except Exception as error:
         await session.rollback()
@@ -464,12 +556,34 @@ async def save(
     return message
 
 
+# Failures where the provider refused the request before doing any work.
+REFUSED_BY_PROVIDER = frozenset({"ai_misconfigured", "ai_rejected"})
+
+
 async def release(
-    session: AsyncSession, conversation_id: uuid.UUID, user_message_id: uuid.UUID
+    session: AsyncSession,
+    conversation_id: uuid.UUID,
+    user_message_id: uuid.UUID,
+    meter: usage.GenerationMeter | None = None,
+    *,
+    status: UsageStatus = UsageStatus.FAILED,
+    error_code: str | None = None,
 ) -> None:
-    """Give the conversation back after a failed answer. Never raises: the lease also expires."""
+    """Give the conversation back after a failed or abandoned answer, and record what the
+    attempt used. Never raises: the lease and the reservation also expire."""
     try:
         await session.rollback()
+        if meter is not None:
+            await usage.finalize(
+                session,
+                meter.reservation_id,
+                meter.outcome(
+                    status,
+                    error_code=error_code,
+                    refused_by_provider=error_code in REFUSED_BY_PROVIDER,
+                ),
+                commit=False,
+            )
         await session.execute(
             update(Conversation)
             .where(
@@ -504,6 +618,7 @@ async def ask(
     embedder = embedder_provider()
     model = chat_model_provider()
 
+    await admit(session, conversation_id, user_id)
     turn = await begin(session, conversation_id, user_id, question, client_message_id)
     if turn.reply is not None:
         return ChatResult(turn.user_message, turn.reply, replayed=True)
@@ -512,8 +627,17 @@ async def ask(
         answer = await produce(
             session, embedder, model, turn, user_id, question, top_k, document_ids, settings
         )
-        assistant = await save(session, conversation_id, user_id, turn.user_message, answer)
+        assistant = await save(
+            session, conversation_id, user_id, turn.user_message, answer, meter=turn.meter
+        )
+    except AppError as error:
+        await release(
+            session, conversation_id, turn.user_message.id, turn.meter, error_code=error.code
+        )
+        raise
     except Exception:
-        await release(session, conversation_id, turn.user_message.id)
+        await release(
+            session, conversation_id, turn.user_message.id, turn.meter, error_code="internal"
+        )
         raise
     return ChatResult(turn.user_message, assistant, replayed=False)

@@ -13,6 +13,11 @@ When the client goes away (or stops the answer), the stream is closed: generatio
 upstream, nothing is stored, and the lease is released at once, so the question can be
 answered again with the same client_message_id. Once storing has begun it is finished, even if
 the client has gone: the answer is then there on reload.
+
+Usage: one streamed answer is one usage record, reserved in `chat.begin` and finalised
+exactly once, never one per text piece. A completed answer records the provider's counts
+from its final event. A stream that fails or is abandoned has no such event, so it records
+an estimate: the prompt that was sent and the text received so far.
 """
 
 import logging
@@ -27,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings
 from app.core.errors import AppError
 from app.models.conversation import Message
+from app.models.usage import UsageStatus
 from app.services import chat
 from app.services.embeddings import Embedder
 from app.services.llm import ChatModel, Generation, LLMError, TextDelta
@@ -106,14 +112,24 @@ class AnswerStream:
         self.assistant_message_id = turn.reply.id if turn.reply is not None else uuid.uuid4()
         # Nothing to release once an answer is stored, or when replaying a stored one.
         self._settled = turn.reply is not None
+        # Set when answering failed, as opposed to being abandoned by the client.
+        self._error_code: str | None = None
 
     async def close(self) -> None:
         if self._settled:
             return
         self._settled = True
         # Shielded: this runs while the request is being cancelled, when the client has gone.
+        failed = self._error_code is not None
         with anyio.CancelScope(shield=True):
-            await chat.release(self._session, self._conversation_id, self._turn.user_message.id)
+            await chat.release(
+                self._session,
+                self._conversation_id,
+                self._turn.user_message.id,
+                self._turn.meter,
+                status=UsageStatus.FAILED if failed else UsageStatus.CANCELLED,
+                error_code=self._error_code if failed else "client_disconnected",
+            )
         logger.info("Answer in conversation %s ended without being stored", self._conversation_id)
 
     async def events(self) -> AsyncIterator[StreamEvent]:
@@ -140,6 +156,9 @@ class AnswerStream:
                 provisional = ProvisionalText(prepared.context.boundary)
                 reader = AnswerFieldReader()
                 generation: Generation | None = None
+                meter = turn.meter
+                if meter is not None:
+                    meter.started(prepared.instructions, prepared.turns, streamed=True)
                 try:
                     async with aclosing(
                         self._model.stream(
@@ -151,12 +170,20 @@ class AnswerStream:
                     ) as upstream:
                         async for item in upstream:
                             if isinstance(item, TextDelta):
+                                if meter is not None:
+                                    meter.receive(item.text)
                                 text = provisional.feed(reader.feed(item.text))
                                 if text:
                                     yield Delta(text)
                             else:
                                 generation = item
+                                if meter is not None:
+                                    meter.reported(
+                                        item.input_tokens, item.output_tokens, item.model
+                                    )
                 except LLMError as error:
+                    if meter is not None:
+                        meter.reported(error.input_tokens, error.output_tokens, error.model)
                     raise chat.ai_error(error) from error
                 if generation is None:
                     raise chat.ai_error(
@@ -175,14 +202,17 @@ class AnswerStream:
                     turn.user_message,
                     answer,
                     message_id=self.assistant_message_id,
+                    meter=turn.meter,
                 )
             self._settled = True
             yield Completed(message, replayed=False)
         except AppError as error:
+            self._error_code = error.code
             await self.close()
             yield Failed(error)
         except Exception:
             logger.exception("Streaming an answer failed in conversation %s", self._conversation_id)
+            self._error_code = "answer_failed"
             await self.close()
             yield Failed(unexpected_failure())
         finally:

@@ -11,6 +11,7 @@ import asyncio
 import logging
 import math
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Protocol
 
@@ -43,6 +44,21 @@ class Embedder(Protocol):
     async def embed(self, texts: list[str]) -> list[list[float]]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class Embedded:
+    vectors: list[list[float]]
+    # Tokens the provider reported for the request(s), or None if it reported none.
+    input_tokens: int | None
+
+
+async def embed_metered(embedder: Embedder, texts: list[str]) -> Embedded:
+    """Embed, and say how many tokens the provider counted when the embedder can tell."""
+    metered = getattr(embedder, "embed_with_usage", None)
+    if metered is not None:
+        return await metered(texts)
+    return Embedded(await embedder.embed(texts), None)
+
+
 EmbedderProvider = Callable[[], Embedder]
 Sleep = Callable[[float], Awaitable[None]]
 
@@ -73,21 +89,29 @@ class OpenAIEmbedder:
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         """One vector per input, in the same order. Identical inputs are sent once."""
+        return (await self.embed_with_usage(texts)).vectors
+
+    async def embed_with_usage(self, texts: list[str]) -> Embedded:
+        """`embed`, with the token count the provider reported (None if any request lacked
+        one)."""
         if not texts:
-            return []
+            return Embedded([], 0)
         if any(not text.strip() for text in texts):
             raise EmbeddingError("Cannot embed empty text.", retryable=False)
 
         unique = list(dict.fromkeys(texts))
         vectors: dict[str, list[float]] = {}
+        tokens: int | None = 0
         # One request at a time: simple, and it keeps well inside the API's rate limits.
         for start in range(0, len(unique), self._batch_size):
             batch = unique[start : start + self._batch_size]
-            for text, vector in zip(batch, await self._embed_batch(batch), strict=True):
+            batch_vectors, batch_tokens = await self._embed_batch(batch)
+            for text, vector in zip(batch, batch_vectors, strict=True):
                 vectors[text] = vector
-        return [vectors[text] for text in texts]
+            tokens = None if tokens is None or batch_tokens is None else tokens + batch_tokens
+        return Embedded([vectors[text] for text in texts], tokens)
 
-    async def _embed_batch(self, batch: list[str]) -> list[list[float]]:
+    async def _embed_batch(self, batch: list[str]) -> tuple[list[list[float]], int | None]:
         for attempt in range(1, self._max_attempts + 1):
             try:
                 return await self._request(batch)
@@ -128,7 +152,7 @@ class OpenAIEmbedder:
         """Exponential backoff with jitter, or the wait the API asked for if that is longer."""
         return backoff_delay(attempt, self._base_delay, error)
 
-    async def _request(self, batch: list[str]) -> list[list[float]]:
+    async def _request(self, batch: list[str]) -> tuple[list[list[float]], int | None]:
         # The SDK's own retries are switched off (see `get_embedder`), so retries happen
         # only in `_embed_batch`, where they are bounded and observable.
         response = await self._client.embeddings.create(
@@ -137,7 +161,11 @@ class OpenAIEmbedder:
             dimensions=self._dimensions,
             encoding_format="float",
         )
-        return self._validated(response.data, len(batch))
+        usage = getattr(response, "usage", None)
+        tokens = getattr(usage, "prompt_tokens", None)
+        return self._validated(response.data, len(batch)), tokens if isinstance(
+            tokens, int
+        ) else None
 
     def _validated(self, data: list, expected: int) -> list[list[float]]:  # noqa: ANN001
         """Refuse a response that is not exactly one well-formed vector per input."""

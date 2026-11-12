@@ -17,9 +17,11 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.errors import AppError
 from app.models.document import Document, DocumentStatus
 from app.models.workspace import WorkspaceMember, WorkspaceRole
+from app.services import usage
 from app.services import workspaces as workspace_service
 from app.services.file_validation import ValidatedFile
 from app.services.processing import STALE_AFTER, ProcessingQueue, owns_storage_path
@@ -89,6 +91,35 @@ def storage_path_of(document: Document) -> str:
     return document.storage_path
 
 
+def ingestion_busy(limit: int) -> AppError:
+    return AppError(
+        429,
+        "ingestion_busy",
+        f"This workspace already has {limit} documents waiting to be processed. Upload more "
+        "once some are ready.",
+        retry_after_seconds=30,
+    )
+
+
+async def ensure_ingestion_capacity(session: AsyncSession, workspace_id: uuid.UUID) -> None:
+    """Refuse more work while the workspace has its maximum number of documents waiting or
+    being processed. Takes a workspace lock held until the caller's transaction ends, so two
+    uploads cannot both take the last place."""
+    limit = get_settings().max_ingestion_jobs_per_workspace
+    await usage.lock(session, "ingestion", workspace_id)
+    waiting = await session.scalar(
+        select(func.count())
+        .select_from(Document)
+        .where(
+            Document.workspace_id == workspace_id,
+            Document.status.in_([DocumentStatus.UPLOADED.value, DocumentStatus.PROCESSING.value]),
+        )
+    )
+    if (waiting or 0) >= limit:
+        await session.rollback()
+        raise ingestion_busy(limit)
+
+
 async def create(
     session: AsyncSession,
     storage: Storage,
@@ -108,6 +139,7 @@ async def create(
     )
     if existing_name is not None:
         raise duplicate(existing_name)
+    await ensure_ingestion_capacity(session, workspace_id)
 
     document_id = uuid.uuid4()
     # Built only from server-generated IDs and a sanitised ASCII name: nothing in this path
@@ -252,6 +284,8 @@ async def retry(
         raise AppError(
             409, "not_retryable", "Only a document that failed to process can be retried."
         )
+    if not interrupted:
+        await ensure_ingestion_capacity(session, document.workspace_id)
 
     document.status = DocumentStatus.UPLOADED.value
     document.error = None

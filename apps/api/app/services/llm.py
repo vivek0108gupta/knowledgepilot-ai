@@ -70,10 +70,24 @@ class LLMError(Exception):
     too_long          the answer reached the output token limit before it was finished
     """
 
-    def __init__(self, message: str, *, code: str, retryable: bool) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        retryable: bool,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+        model: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.retryable = retryable
+        # What the provider reported using, when it reported anything despite the failure
+        # (an answer cut off by the output limit is still billed).
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+        self.model = model
 
 
 class ChatModel(Protocol):
@@ -263,8 +277,14 @@ class OpenAIResponsesModel:
             logger.error("Model response was not completed: %s", reason)
             if reason == "max_output_tokens":
                 # An unfinished answer cannot be checked, and asking again gets the same.
+                usage = response.usage
                 raise LLMError(
-                    "The answer reached the output limit.", code="too_long", retryable=False
+                    "The answer reached the output limit.",
+                    code="too_long",
+                    retryable=False,
+                    input_tokens=getattr(usage, "input_tokens", None),
+                    output_tokens=getattr(usage, "output_tokens", None),
+                    model=response.model,
                 )
             raise LLMError(
                 "The AI service did not finish its answer.",

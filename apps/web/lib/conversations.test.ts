@@ -263,3 +263,18 @@ describe("asking", () => {
     expect(chatErrorMessage(new TypeError("boom"))).toBe("Something went wrong. Please try again.");
   });
 });
+
+describe("limit refusals", () => {
+  test.each([
+    ["rate_limited", "Too many requests from you. Try again in 12 seconds."],
+    ["user_quota_exceeded", "You have reached your daily AI usage limit. It resets at midnight UTC."],
+    ["workspace_quota_exceeded", "This workspace has reached its monthly spending limit."],
+    ["concurrent_generation_limit", "You already have 3 answers being written. Wait for one to finish."],
+    ["usage_unavailable", "Usage limits could not be checked, so the request was not run."],
+  ])("%s shows the API's explanation and is not offered as a retry of a kept question", (code, message) => {
+    const error = new ApiError(code === "usage_unavailable" ? 503 : 429, code, message);
+
+    expect(chatErrorMessage(error)).toBe(message);
+    expect(questionWasKept(error)).toBe(false);
+  });
+});

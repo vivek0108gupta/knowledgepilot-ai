@@ -15,12 +15,15 @@ from dataclasses import dataclass
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.errors import AppError
 from app.models.chunk import DocumentChunk
 from app.models.document import Document, DocumentStatus
+from app.models.usage import UsageOperation, UsageSource, UsageStatus
 from app.models.workspace import WorkspaceMember
+from app.services import rate_limits, usage
 from app.services import workspaces as workspace_service
-from app.services.embeddings import Embedder, EmbeddingError
+from app.services.embeddings import Embedder, EmbeddingError, embed_metered
 
 logger = logging.getLogger(__name__)
 
@@ -56,18 +59,65 @@ async def search(
 ) -> list[Match]:
     # 404 for a workspace the caller is not in, before any text is sent to the embedding API.
     await workspace_service.get_access(session, workspace_id, user_id)
+    await session.rollback()
+    await rate_limits.hit(session, rate_limits.search_per_user(get_settings()), user_id)
+    await usage.ensure_available(session, user_id, workspace_id, usage.count_tokens(query))
     # Do not hold a database connection while waiting on the embedding API.
     await session.rollback()
 
-    try:
-        (query_vector,) = await embedder.embed([query])
-    except EmbeddingError as error:
-        logger.error("Query embedding failed (retryable: %s)", error.retryable)
-        raise embeddings_unavailable() from error
+    (query_vector,) = await embed_query(session, embedder, user_id, workspace_id, [query])
 
     return await nearest(
         session, workspace_id, user_id, query_vector, top_k, document_ids, min_similarity
     )
+
+
+async def embed_query(
+    session: AsyncSession,
+    embedder: Embedder,
+    user_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    queries: list[str],
+    *,
+    conversation_id: uuid.UUID | None = None,
+) -> list[list[float]]:
+    """Embed search queries (all in one request) and record the usage, whether it succeeds
+    or fails. Used by search and by question answering."""
+    model = get_settings().embedding_model
+    estimate = sum(usage.count_tokens(query) for query in queries)
+    try:
+        embedded = await embed_metered(embedder, queries)
+    except EmbeddingError as error:
+        logger.error("Query embedding failed (retryable: %s)", error.retryable)
+        # A refused request is not billed; one that failed after retries may have been.
+        source = UsageSource.ESTIMATED if error.retryable else UsageSource.NONE
+        await usage.record(
+            session,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            operation=UsageOperation.QUERY_EMBEDDING,
+            model=model,
+            outcome=usage.Outcome(
+                UsageStatus.FAILED, source, estimate, 0, error_code="embeddings_unavailable"
+            ),
+            conversation_id=conversation_id,
+        )
+        raise embeddings_unavailable() from error
+    outcome = (
+        usage.Outcome(UsageStatus.COMPLETED, UsageSource.PROVIDER, embedded.input_tokens, 0)
+        if embedded.input_tokens is not None
+        else usage.Outcome(UsageStatus.COMPLETED, UsageSource.ESTIMATED, estimate, 0)
+    )
+    await usage.record(
+        session,
+        user_id=user_id,
+        workspace_id=workspace_id,
+        operation=UsageOperation.QUERY_EMBEDDING,
+        model=model,
+        outcome=outcome,
+        conversation_id=conversation_id,
+    )
+    return embedded.vectors
 
 
 async def nearest(

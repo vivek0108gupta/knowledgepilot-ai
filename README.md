@@ -544,6 +544,25 @@ Every event has an increasing `id`. A stream ends after `message_completed` or `
 - **The excerpt is short,** a quote or the start of the passage, not the whole passage.
 - **No answer feedback, editing or regeneration** yet, and **no rate limit or cost cap** per user.
 
+## Security and cost controls
+
+Every AI operation is rate-limited, checked against quotas before the provider is called, and
+metered in a usage ledger with versioned, configurable pricing. Workspace owners and admins
+see their workspace's usage under **Usage**; members see their own. Limits and prices are
+environment variables (see `.env.example`).
+
+- [Architecture](docs/security-cost-controls-architecture.md): schema, lifecycles, algorithms,
+  endpoints.
+- [Operations](docs/security-cost-controls-operations.md): settings, changing prices and limits,
+  recovery.
+- [Testing](docs/security-cost-controls-testing.md): what is covered, and results.
+- [Audit](docs/security-cost-controls-audit.md): the findings that led to it.
+
+Refusals use `429` with `rate_limited`, `user_quota_exceeded`, `workspace_quota_exceeded`,
+`concurrent_generation_limit`, `workspace_busy` or `ingestion_busy`, a `retry_after_seconds`
+field and a `Retry-After` header. If limits cannot be checked, the request is refused with
+`503 usage_unavailable`; it is never run unchecked.
+
 ## Configuration
 
 Everything is configured through environment variables, and every one has a local default, so no `.env` is needed to start. To change something, copy `.env.example` to `.env` and edit it; Compose reads it automatically. `.env` is gitignored: never commit real values.
@@ -590,7 +609,7 @@ uv run alembic revision --autogenerate -m "describe the change"
 uv run alembic downgrade -1
 ```
 
-Migrations so far: `0001` pgvector, `0002` workspaces and members, `0003` documents, `0004` document chunks, `0005` conversations and messages, `0006` the answer lease (two nullable columns on `conversations`). Neither `0005` nor `0006` changes existing data. The API container applies pending migrations when it starts, so `docker compose up --build -d` is enough to upgrade.
+Migrations so far: `0001` pgvector, `0002` workspaces and members, `0003` documents, `0004` document chunks, `0005` conversations and messages, `0006` the answer lease (two nullable columns on `conversations`), `0007` usage metering, workspace quota policies and rate-limit buckets (three new tables). Neither `0005` nor `0006` changes existing data. The API container applies pending migrations when it starts, so `docker compose up --build -d` is enough to upgrade.
 
 For autogenerate to see a new model, import its module in `app/models/__init__.py`.
 

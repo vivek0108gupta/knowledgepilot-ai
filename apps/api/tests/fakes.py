@@ -91,6 +91,8 @@ class FakeEmbedder:
         self.fail: EmbeddingError | None = None
         # Fail only once this many calls have succeeded (None: fail from the first call).
         self.fail_after: int | None = None
+        # Whether `embed_with_usage` reports token counts, as the real provider does.
+        self.report_usage = True
 
     @property
     def texts(self) -> list[str]:
@@ -103,6 +105,15 @@ class FakeEmbedder:
             raise self.fail
         self.calls.append(list(texts))
         return [fake_vector(text) for text in texts]
+
+    async def embed_with_usage(self, texts: list[str]):  # noqa: ANN201
+        """Like the real embedder: vectors plus a provider-style token count (one token per
+        word here), or None when `report_usage` is off."""
+        from app.services.embeddings import Embedded
+
+        vectors = await self.embed(texts)
+        tokens = sum(len(text.split()) for text in texts) if self.report_usage else None
+        return Embedded(vectors, tokens)
 
 
 SOURCE_BLOCK = re.compile(

@@ -17,16 +17,27 @@ class AppError(Exception):
         code: str,
         message: str,
         headers: dict[str, str] | None = None,
+        *,
+        retry_after_seconds: int | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
-        self.headers = headers
+        self.headers = dict(headers or {})
+        # When trying again can succeed after a wait, how long to wait. Sent both as a
+        # `Retry-After` header and in the error body, which browsers can always read.
+        self.retry_after_seconds = retry_after_seconds
+        if retry_after_seconds is not None:
+            self.headers["Retry-After"] = str(retry_after_seconds)
 
 
 def error_response(
-    status_code: int, code: str, message: str, details: list[dict[str, object]] | None = None
+    status_code: int,
+    code: str,
+    message: str,
+    details: list[dict[str, object]] | None = None,
+    retry_after_seconds: int | None = None,
 ) -> JSONResponse:
     """Every error leaves the API in this one shape."""
     error: dict[str, object] = {
@@ -36,6 +47,8 @@ def error_response(
     }
     if details is not None:
         error["details"] = details
+    if retry_after_seconds is not None:
+        error["retry_after_seconds"] = retry_after_seconds
     return JSONResponse(status_code=status_code, content={"error": error})
 
 
@@ -45,7 +58,9 @@ def internal_error_response() -> JSONResponse:
 
 
 async def handle_app_error(_request: Request, error: AppError) -> JSONResponse:
-    response = error_response(error.status_code, error.code, error.message)
+    response = error_response(
+        error.status_code, error.code, error.message, retry_after_seconds=error.retry_after_seconds
+    )
     if error.headers:
         response.headers.update(error.headers)
     return response

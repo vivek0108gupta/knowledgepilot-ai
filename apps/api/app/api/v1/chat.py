@@ -13,6 +13,7 @@ from app.api.v1.conversations import message_out
 from app.api.v1.search import EmbedderDep
 from app.core.config import Settings, get_settings
 from app.core.errors import AppError
+from app.models.usage import UsageOperation
 from app.schemas.conversation import ChatRequest, ChatResponse, MessageOut
 from app.services import chat as service
 from app.services import chat_stream
@@ -216,8 +217,14 @@ async def chat_stream_endpoint(
     # Fail before storing anything if the server cannot answer at all.
     embedder = embedder_provider()
     model = chat_model_provider()
+    await service.admit(session, conversation_id, user.id)
     turn = await service.begin(
-        session, conversation_id, user.id, body.message, body.client_message_id
+        session,
+        conversation_id,
+        user.id,
+        body.message,
+        body.client_message_id,
+        operation=UsageOperation.CHAT_STREAM,
     )
     stream = chat_stream.AnswerStream(
         session,

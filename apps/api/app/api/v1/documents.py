@@ -10,6 +10,7 @@ from app.core.config import get_settings
 from app.models.document import MAX_DOCUMENT_BYTES, DocumentStatus
 from app.schemas.document import DocumentOut, DocumentPage, DocumentStatusOut, DownloadOut
 from app.services import documents as service
+from app.services import rate_limits
 from app.services import workspaces as workspace_service
 from app.services.file_validation import validate_upload
 from app.services.processing import ProcessingQueue, StorageProvider, get_processing_queue
@@ -62,6 +63,9 @@ async def upload_document(
     make the server receive a large file.
     """
     await workspace_service.get_access(session, workspace_id, user.id)
+    await session.rollback()
+    # Counted before the body is read, so a refused upload costs no bandwidth.
+    await rate_limits.hit(session, rate_limits.upload_per_user(get_settings()), user.id)
     # Release the database connection while the file is received.
     await session.rollback()
     storage = storage_provider()

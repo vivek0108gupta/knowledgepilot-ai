@@ -122,6 +122,18 @@ export const askQuestion = (conversationId: string, message: string, clientMessa
     body: { message, client_message_id: clientMessageId },
   });
 
+/** Refusals by a rate limit or quota. Nothing was stored; the message explains the limit. */
+export const LIMIT_CODES = new Set([
+  "rate_limited",
+  "user_quota_exceeded",
+  "workspace_quota_exceeded",
+  "concurrent_generation_limit",
+  "workspace_busy",
+  "usage_unavailable",
+  "ingestion_busy",
+  "input_too_large",
+]);
+
 /** Failures after which the question is already stored, so retrying is the right move. */
 const SAVED_QUESTION_CODES = new Set([
   "ai_unavailable",
@@ -156,6 +168,8 @@ export function chatErrorMessage(error: unknown): string {
     return "The answer to this question is still being written. Try again in a moment.";
   if (error.code === "ai_not_configured") return "Answering questions has not been set up on the server yet.";
   if (error.status === 422) return "That question could not be sent. Shorten or change it and try again.";
+  // Rate limits and quotas: the API's message says which limit and when it resets.
+  if (LIMIT_CODES.has(error.code)) return error.message;
   if (error.status === 429) return "Too many requests. Wait a moment and try again.";
   // These messages are written by the API for people, and say the question was kept.
   if (SAVED_QUESTION_CODES.has(error.code) || error.code === "conversation_archived") return error.message;

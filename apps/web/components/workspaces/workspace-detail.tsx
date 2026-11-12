@@ -345,6 +345,9 @@ export function WorkspaceDetail() {
             <Link href={`${WORKSPACES_PATH}/${data.id}/chat`} className={buttonClass("primary", "sm")}>
               Open chat
             </Link>
+            <Link href={`${WORKSPACES_PATH}/${data.id}/usage`} className={buttonClass("secondary", "sm")}>
+              Usage
+            </Link>
             <Link href={WORKSPACES_PATH} className={buttonClass("secondary", "sm")}>
               All workspaces
             </Link>

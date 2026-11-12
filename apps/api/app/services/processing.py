@@ -13,6 +13,11 @@ A document becomes `ready` only after every chunk has its vector saved. Chunks a
 in batches while the document is still `processing`, where search cannot see them, and are
 removed again if anything fails.
 
+Usage: each document's embeddings are one usage record. Before the first embedding call, the
+document's whole token count (plus chunk overlap) is reserved against the uploader's and the
+workspace's quotas; a document over a limit fails with a message saying so, and nothing is
+sent to the provider. The provider's reported token counts are recorded as batches finish.
+
 Limitations of running in-process (see the README): this is not a durable queue. Work in
 progress is lost if the API process stops, and there is no retry schedule.
 `ProcessingQueue` is the seam for one: a worker in another process would call
@@ -22,6 +27,7 @@ progress is lost if the API process stops, and there is no retry schedule.
 import asyncio
 import itertools
 import logging
+import math
 import tempfile
 import uuid
 from collections.abc import Callable, Iterator
@@ -37,8 +43,10 @@ from app.core.config import get_settings
 from app.core.errors import AppError
 from app.models.chunk import DocumentChunk
 from app.models.document import Document, DocumentSegment, DocumentStatus
+from app.models.usage import UsageOperation, UsageSource, UsageStatus
+from app.services import usage
 from app.services.chunking import Chunk, chunk_segments
-from app.services.embeddings import EmbedderProvider, EmbeddingError, get_embedder
+from app.services.embeddings import EmbedderProvider, EmbeddingError, embed_metered, get_embedder
 from app.services.extraction import Extraction, ExtractionError, extract
 from app.services.file_validation import KIND_BY_MIME
 from app.services.storage import Storage, get_storage
@@ -132,11 +140,39 @@ def chunk_row(document: Document, chunk: Chunk, vector: list[float]) -> dict[str
     }
 
 
+class EmbeddingMeter:
+    """Tokens embedded so far for one document: as reported by the provider, and as counted
+    here for any batch it did not report on."""
+
+    def __init__(self) -> None:
+        self.reported = 0
+        self.estimated = 0
+        self.in_flight = 0
+
+    def outcome(self, status: UsageStatus, error_code: str | None = None) -> usage.Outcome:
+        if status == UsageStatus.COMPLETED and self.estimated == 0:
+            return usage.Outcome(status, UsageSource.PROVIDER, self.reported, 0)
+        # A batch the provider did not report on, or one that was sent when the work
+        # stopped, is counted at its own token count: it may have been billed.
+        estimated = self.reported + self.estimated + self.in_flight
+        source = UsageSource.ESTIMATED if estimated else UsageSource.NONE
+        return usage.Outcome(status, source, estimated, 0, error_code=error_code)
+
+
+def ingestion_estimate(extraction: Extraction, chunk_tokens: int, overlap_tokens: int) -> int:
+    """The tokens a document's chunks will hold: its text, plus the overlap repeated between
+    neighbouring chunks, plus a little for chunk boundaries."""
+    text_tokens = sum(usage.count_tokens(segment.content) for segment in extraction.segments)
+    stride = max(1, chunk_tokens - overlap_tokens)
+    return math.ceil(text_tokens * chunk_tokens / stride) + 16
+
+
 async def embed_and_store(
     session: AsyncSession,
     document: Document,
     chunks: Iterator[Chunk],
     embedder_provider: EmbedderProvider,
+    meter: EmbeddingMeter | None = None,
 ) -> int:
     """Embed the chunks a batch at a time and write each batch as it completes.
 
@@ -152,7 +188,17 @@ async def embed_and_store(
         if not batch:
             return written
 
-        vectors = await embedder.embed([chunk.content for chunk in batch])
+        batch_tokens = sum(chunk.token_count for chunk in batch)
+        if meter is not None:
+            meter.in_flight = batch_tokens
+        embedded = await embed_metered(embedder, [chunk.content for chunk in batch])
+        if meter is not None:
+            meter.in_flight = 0
+            if embedded.input_tokens is not None:
+                meter.reported += embedded.input_tokens
+            else:
+                meter.estimated += batch_tokens
+        vectors = embedded.vectors
         if len(vectors) != len(batch):
             raise EmbeddingError(
                 "The embedding service returned an invalid response.", retryable=False
@@ -234,6 +280,26 @@ async def finish(
     return True
 
 
+QUOTA_MESSAGES = {
+    "user_quota_exceeded": "The uploader has reached their daily AI usage limit. Retry this "
+    "document after midnight UTC.",
+    "workspace_quota_exceeded": "This workspace has reached its monthly AI usage limit, so the "
+    "document was not indexed. Retry it once the limit allows.",
+    "workspace_busy": "This workspace was running too many AI operations at once. Retry this "
+    "document.",
+    "usage_unavailable": "Usage limits could not be checked, so the document was not indexed. "
+    "Try again.",
+}
+
+
+def failure_message(error: AppError) -> str:
+    if error.code in QUOTA_MESSAGES:
+        return QUOTA_MESSAGES[error.code]
+    if error.code.startswith("embeddings_"):
+        return NOT_CONFIGURED_MESSAGE
+    return "The file could not be read from storage. Try again."
+
+
 async def process_document(
     document_id: uuid.UUID,
     session_factory: SessionFactory,
@@ -277,7 +343,46 @@ async def process_document(
                 chunk_tokens=settings.chunk_size_tokens,
                 overlap_tokens=settings.chunk_overlap_tokens,
             )
-            chunk_count = await embed_and_store(session, document, chunks, embedder_provider)
+            if not extraction.segments:
+                raise ExtractionError("No text could be found in this document.")
+            reservation = await usage.reserve(
+                session,
+                user_id=document.uploaded_by,
+                workspace_id=document.workspace_id,
+                operation=UsageOperation.DOCUMENT_EMBEDDING,
+                model=settings.embedding_model,
+                input_tokens=await asyncio.to_thread(
+                    ingestion_estimate,
+                    extraction,
+                    settings.chunk_size_tokens,
+                    settings.chunk_overlap_tokens,
+                ),
+                output_tokens=0,
+                # One reservation per processing attempt: claiming stamps updated_at.
+                idempotency_key=f"document_embedding:{document.id}:{document.updated_at.isoformat()}",
+                ttl_seconds=settings.ingestion_reservation_ttl_seconds,
+                document_id=document.id,
+            )
+            meter = EmbeddingMeter()
+            try:
+                chunk_count = await embed_and_store(
+                    session, document, chunks, embedder_provider, meter
+                )
+            except DocumentGone:
+                await usage.finalize(
+                    session,
+                    reservation.id,
+                    meter.outcome(UsageStatus.CANCELLED, "document_deleted"),
+                )
+                raise
+            except BaseException as error:
+                code = "embeddings_unavailable" if isinstance(error, EmbeddingError) else "failed"
+                await session.rollback()
+                await usage.finalize(
+                    session, reservation.id, meter.outcome(UsageStatus.FAILED, code)
+                )
+                raise
+            await usage.finalize(session, reservation.id, meter.outcome(UsageStatus.COMPLETED))
             if chunk_count == 0:
                 raise ExtractionError("No text could be found in this document.")
 
@@ -310,13 +415,7 @@ async def process_document(
             )
         except AppError as error:
             logger.error("Document %s failed: %s", document_id, error.code)
-            await mark_failed(
-                session,
-                document_id,
-                NOT_CONFIGURED_MESSAGE
-                if error.code.startswith("embeddings_")
-                else "The file could not be read from storage. Try again.",
-            )
+            await mark_failed(session, document_id, failure_message(error))
         except Exception:
             # The traceback goes to the logs; the user gets a message with no internals.
             logger.exception("Document %s failed unexpectedly", document_id)

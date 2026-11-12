@@ -1,7 +1,21 @@
+from decimal import Decimal
 from functools import lru_cache
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Default model prices for usage cost estimates: OpenAI's published list prices for the
+# models this application uses, as known when written, in USD per million tokens. They are
+# estimates (no discounts, cached input or later price changes); replace them, with a new
+# version label, through USAGE_PRICING_JSON. See app/services/pricing.py.
+DEFAULT_PRICING = {
+    "version": "openai-list-2025-04",
+    "currency": "USD",
+    "models": {
+        "gpt-4.1-mini": {"input_per_million": "0.40", "output_per_million": "1.60"},
+        "text-embedding-3-small": {"input_per_million": "0.02", "output_per_million": "0"},
+    },
+}
 
 
 class Settings(BaseSettings):
@@ -84,6 +98,54 @@ class Settings(BaseSettings):
     # Results less similar than this are left out, so an unrelated query returns nothing
     # instead of the least-bad passages. 0 disables the cut-off.
     search_min_similarity: float = 0.2
+
+    # --- Security and cost controls (docs/security-cost-controls-architecture.md) ---------
+    # Every limit is a default for local development; set them per deployment.
+    rate_limits_enabled: bool = True
+    # Requests per user (and, for chat, per workspace) in a sliding window. /chat and
+    # /chat/stream share the chat limits.
+    rate_limit_chat_per_minute: int = Field(default=10, ge=1)
+    rate_limit_chat_per_workspace_per_minute: int = Field(default=60, ge=1)
+    rate_limit_search_per_minute: int = Field(default=30, ge=1)
+    rate_limit_upload_per_hour: int = Field(default=10, ge=1)
+
+    # Answers being written at once, per user (across conversations), and AI operations of
+    # any kind at once per workspace.
+    max_concurrent_generations_per_user: int = Field(default=3, ge=1)
+    max_concurrent_ai_operations_per_workspace: int = Field(default=10, ge=1)
+    # Documents waiting for or undergoing ingestion at once per workspace. Uploads beyond
+    # this are refused until some finish.
+    max_ingestion_jobs_per_workspace: int = Field(default=5, ge=1)
+
+    # Quotas. Tokens are input plus output, of every AI operation. Days and months are UTC.
+    user_daily_token_limit: int = Field(default=500_000, ge=1)
+    user_daily_chat_limit: int = Field(default=200, ge=1)
+    workspace_monthly_token_limit: int = Field(default=5_000_000, ge=1)
+    # In the pricing table's currency. Checked against estimated cost, not an invoice.
+    workspace_monthly_cost_limit: Decimal = Field(default=Decimal("10.00"), ge=0)
+
+    # The most input a single answer may send to the model, as estimated before the call.
+    chat_max_input_tokens: int = Field(default=12_000, ge=1000)
+
+    # A reservation not finalised within this time is treated as abandoned (for example
+    # after a crash): it stops counting as running, and its estimate stays charged.
+    usage_reservation_ttl_seconds: int = Field(default=600, ge=60)
+    ingestion_reservation_ttl_seconds: int = Field(default=3600, ge=60)
+
+    # Replaces the default price table (app/services/pricing.py) without a code change.
+    # JSON: {"version": "...", "currency": "USD", "models": {"<model prefix>":
+    # {"input_per_million": "0.40", "output_per_million": "1.60"}}}.
+    usage_pricing_json: str = ""
+
+    @model_validator(mode="after")
+    def check_limits(self) -> "Settings":
+        # A lease must outlive the longest answer, and a reservation the lease, or a slow
+        # answer would be counted as abandoned while it is still being written.
+        if self.usage_reservation_ttl_seconds <= self.chat_generation_lease_seconds:
+            raise ValueError("USAGE_RESERVATION_TTL_SECONDS must exceed the generation lease")
+        if self.chat_max_output_tokens < 1 or self.chat_max_output_tokens > 32_768:
+            raise ValueError("CHAT_MAX_OUTPUT_TOKENS must be between 1 and 32768")
+        return self
 
     @property
     def jwt_issuer(self) -> str:

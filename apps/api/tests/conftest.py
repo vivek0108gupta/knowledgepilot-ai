@@ -25,6 +25,24 @@ os.environ["SEARCH_MIN_SIMILARITY"] = "0.2"
 os.environ["SEARCH_MAX_TOP_K"] = "20"
 os.environ["CHUNK_SIZE_TOKENS"] = "800"
 os.environ["CHUNK_OVERLAP_TOKENS"] = "100"
+# Generous limits for the suite as a whole, so tests about other things are never refused.
+# Tests of the limits themselves set their own values (tests/test_cost_controls.py).
+for name, value in {
+    "RATE_LIMITS_ENABLED": "true",
+    "RATE_LIMIT_CHAT_PER_MINUTE": "100000",
+    "RATE_LIMIT_CHAT_PER_WORKSPACE_PER_MINUTE": "100000",
+    "RATE_LIMIT_SEARCH_PER_MINUTE": "100000",
+    "RATE_LIMIT_UPLOAD_PER_HOUR": "100000",
+    "MAX_CONCURRENT_GENERATIONS_PER_USER": "1000",
+    "MAX_CONCURRENT_AI_OPERATIONS_PER_WORKSPACE": "1000",
+    "MAX_INGESTION_JOBS_PER_WORKSPACE": "1000",
+    "USER_DAILY_TOKEN_LIMIT": "1000000000",
+    "USER_DAILY_CHAT_LIMIT": "100000",
+    "WORKSPACE_MONTHLY_TOKEN_LIMIT": "1000000000",
+    "WORKSPACE_MONTHLY_COST_LIMIT": "1000000",
+    "USAGE_PRICING_JSON": "",
+}.items():
+    os.environ[name] = value
 
 import asyncpg  # noqa: E402
 from alembic import command  # noqa: E402
@@ -121,7 +139,7 @@ async def db_engine(database: None) -> AsyncIterator[AsyncEngine]:
     )
     try:
         async with engine.begin() as connection:
-            await connection.execute(text("TRUNCATE workspaces CASCADE"))
+            await connection.execute(text("TRUNCATE workspaces, rate_limit_buckets CASCADE"))
     except (TimeoutError, OSError) as error:
         await engine.dispose()
         url = make_url(TEST_DATABASE_URL)

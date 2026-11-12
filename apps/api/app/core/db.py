@@ -11,6 +11,9 @@ engine = create_async_engine(
     # Give up on a connection that is accepted but never completes, instead of holding a
     # request for asyncpg's default of a full minute.
     connect_args={"timeout": 10},
+    # Keep bound parameters (message text, document text, tokens) out of exception messages,
+    # which are logged.
+    hide_parameters=True,
 )
 
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
