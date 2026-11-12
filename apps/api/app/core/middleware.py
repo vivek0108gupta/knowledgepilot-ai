@@ -44,3 +44,68 @@ async def request_context(
         return response
     finally:
         request_id_var.reset(token)
+
+
+# The upload route enforces its own, larger limit while it streams the file.
+UPLOAD_ROUTE = re.compile(r"^/api/v1/workspaces/[0-9a-fA-F-]{36}/documents/?$")
+BODY_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+class BodySizeLimit:
+    """Refuse oversized request bodies before any of them is read.
+
+    A request with a body must declare its `Content-Length`, and it must be at most
+    `max_bytes`. Uvicorn never passes on more than the declared length, so the body the
+    application reads is bounded too. Without this, every JSON endpoint would buffer whatever
+    a client sent, signed in or not, before authentication or validation ran.
+    """
+
+    def __init__(self, app: Callable, max_bytes: int) -> None:  # type: ignore[type-arg]
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: dict, receive: Callable, send: Callable) -> None:  # type: ignore[type-arg]
+        if (
+            scope["type"] != "http"
+            or scope["method"] not in BODY_METHODS
+            or (scope["method"] == "POST" and UPLOAD_ROUTE.match(scope["path"]))
+        ):
+            await self.app(scope, receive, send)
+            return
+        headers = dict(scope.get("headers") or [])
+        declared = headers.get(b"content-length")
+        chunked = b"chunked" in headers.get(b"transfer-encoding", b"").lower()
+        if declared is None and not chunked:
+            await self.app(scope, receive, send)  # no body at all
+            return
+        if declared is None:
+            await self._refuse(send, 411, "length_required", "Send a Content-Length header.")
+            return
+        if not declared.isdigit() or int(declared) > self.max_bytes:
+            await self._refuse(
+                send,
+                413,
+                "request_too_large",
+                f"The request body can be at most {self.max_bytes:,} bytes.",
+            )
+            return
+        await self.app(scope, receive, send)
+
+    async def _refuse(self, send: Callable, status: int, code: str, message: str) -> None:  # type: ignore[type-arg]
+        import json
+
+        body = json.dumps(
+            {"error": {"code": code, "message": message, "request_id": request_id_var.get()}}
+        ).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                    (b"connection", b"close"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})

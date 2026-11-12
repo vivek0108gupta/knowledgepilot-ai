@@ -26,6 +26,8 @@ class FakeStorage:
         self.fail_download = False
         self.fail_delete = False
         self.fail_sign = False
+        self.fail_list = False
+        self.created: dict = {}
 
     async def upload(self, path: str, file: BinaryIO, content_type: str, size: int) -> None:
         if self.fail_upload:
@@ -48,6 +50,20 @@ class FakeStorage:
         for path in paths:
             self.deleted.append(path)
             self.objects.pop(path, None)
+
+    async def list_objects(self, prefix: str = ""):  # noqa: ANN201
+        from datetime import UTC, datetime, timedelta
+
+        from app.services.storage import StoredObject
+
+        if self.fail_list:
+            raise StorageError()
+        # Objects count as old enough to audit unless a test says otherwise.
+        return [
+            StoredObject(path, self.created.get(path, datetime.now(UTC) - timedelta(days=1)))
+            for path in sorted(self.objects)
+            if path.startswith(prefix)
+        ]
 
     async def create_signed_url(self, path: str, expires_in: int, download_name: str) -> str:
         if self.fail_sign:

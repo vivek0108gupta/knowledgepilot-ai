@@ -8,7 +8,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-knowledgepilot}
     ports:
       # Host port 5434 by default, so it does not collide with a Postgres already on 5432.
-      - "${POSTGRES_HOST_PORT:-5434}:5432"
+      # Loopback only by default: the database is never reachable from other machines.
+      - "${POSTGRES_BIND_ADDRESS:-127.0.0.1}:${POSTGRES_HOST_PORT:-5434}:5432"
     volumes:
       - db-data:/var/lib/postgresql/data
     healthcheck:
@@ -19,6 +20,8 @@ services:
 
   api:
     build: ./apps/api
+    # Time to hand running ingestion jobs back to the queue before being stopped.
+    stop_grace_period: 20s
     environment:
       ENVIRONMENT: ${ENVIRONMENT:-development}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -72,6 +75,9 @@ services:
       INGESTION_JOB_LEASE_SECONDS: ${INGESTION_JOB_LEASE_SECONDS:-600}
       INGESTION_RETRY_DELAY_SECONDS: ${INGESTION_RETRY_DELAY_SECONDS:-30}
       INGESTION_POLL_SECONDS: ${INGESTION_POLL_SECONDS:-5}
+      INGESTION_SHUTDOWN_GRACE_SECONDS: ${INGESTION_SHUTDOWN_GRACE_SECONDS:-5}
+      MAX_REQUEST_BODY_BYTES: ${MAX_REQUEST_BODY_BYTES:-1048576}
+      API_DOCS_ENABLED: ${API_DOCS_ENABLED:-}
       USAGE_PRICING_JSON: ${USAGE_PRICING_JSON:-}
       EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1536}
       CHUNK_SIZE_TOKENS: ${CHUNK_SIZE_TOKENS:-800}

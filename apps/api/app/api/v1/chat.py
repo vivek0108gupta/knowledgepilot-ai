@@ -190,6 +190,9 @@ async def encode(stream: chat_stream.AnswerStream) -> AsyncGenerator[str]:
 @router.post(
     "/conversations/{conversation_id}/chat/stream",
     response_class=EventStreamResponse,
+    # Explicit, or the OpenAPI schema cannot be generated for a custom streaming response.
+    status_code=status.HTTP_200_OK,
+    response_model=None,
     responses={200: {"content": {"text/event-stream": {}}, "description": "An event stream."}},
 )
 async def chat_stream_endpoint(

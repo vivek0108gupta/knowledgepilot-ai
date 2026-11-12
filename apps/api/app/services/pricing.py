@@ -40,6 +40,10 @@ class Pricing:
     version: str
     currency: str
     models: dict[str, Price]
+    # When these prices took effect, and when they were last checked against the provider's
+    # published prices (ISO dates), if the table says.
+    effective_from: str | None = None
+    verified_on: str | None = None
 
     def price_for(self, model: str | None) -> Price | None:
         """The price of `model`, matched on the longest configured name it starts with, so a
@@ -91,7 +95,15 @@ def parse_pricing(data: object) -> Pricing:
             _decimal(entry.get("input_per_million"), f"{name} input_per_million"),
             _decimal(entry.get("output_per_million", 0), f"{name} output_per_million"),
         )
-    return Pricing(version, currency, prices)
+    dates = {}
+    for field in ("effective_from", "verified_on"):
+        value = data.get(field)
+        if value is not None and (
+            not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value)
+        ):
+            raise PricingError(f"pricing {field} must be a date such as 2026-01-31")
+        dates[field] = value
+    return Pricing(version, currency, prices, **dates)
 
 
 @lru_cache

@@ -86,6 +86,7 @@ describe("usage dashboard", () => {
     );
     expect(screen.getByText(/Everyone's usage in this workspace/)).toBeInTheDocument();
     expect(screen.getByText(/not an invoice/)).toHaveTextContent("openai-list-2025-04");
+    expect(screen.getByText(/not an invoice/)).toHaveTextContent("Totals include usage held");
     expect(screen.getByText(/1 records were estimated/)).toBeInTheDocument();
   });
 
@@ -225,5 +226,30 @@ describe("usage dashboard", () => {
 
     await screen.findByRole("heading", { name: "Usage" });
     expect(screen.queryByRole("region", { name: "Usage alerts" })).not.toBeInTheDocument();
+  });
+
+  test("says when the prices took effect and were last checked", async () => {
+    mocks.getUsageSummary.mockResolvedValue(
+      summary({ pricing_effective_from: "2025-04-14", pricing_verified_on: "2026-11-12" }),
+    );
+    renderWithQuery(<UsageDashboard />);
+
+    expect(await screen.findByText(/not an invoice/)).toHaveTextContent(
+      "Costs are estimates from price table openai-list-2025-04 (USD, prices effective 2025-04-14, last checked 2026-11-12), not an invoice.",
+    );
+  });
+
+  test("labels held usage in the history as held, not as a reserved amount", async () => {
+    mocks.getUsageHistory.mockResolvedValue({
+      items: [event(3, { status: "failed", usage_source: "unavailable" })],
+      total: 1,
+      limit: 20,
+      offset: 0,
+    });
+    renderWithQuery(<UsageDashboard />);
+
+    const table = await screen.findByRole("table", { name: "Usage history, newest first" });
+    expect(within(table).getByText("Held (outcome unknown)")).toBeInTheDocument();
+    expect(within(table).queryByText(/reserved amount/)).not.toBeInTheDocument();
   });
 });

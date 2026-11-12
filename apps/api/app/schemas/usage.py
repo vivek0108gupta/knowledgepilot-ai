@@ -61,6 +61,10 @@ class UsageSummary(BaseModel):
     period_end: datetime
     currency: str
     pricing_version: str
+    # When the current prices took effect and were last verified (null if the table does not
+    # say). Costs are estimates from these prices, never an invoice.
+    pricing_effective_from: str | None = None
+    pricing_verified_on: str | None = None
     totals: UsageTotals
     by_operation: list[OperationUsage]
     by_model: list[ModelUsage]

@@ -8,6 +8,8 @@ that the caller may read the document.
 import asyncio
 import logging
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from functools import lru_cache
 from typing import BinaryIO, Protocol
 from urllib.parse import quote
@@ -39,6 +41,14 @@ class Storage(Protocol):
     async def delete(self, paths: list[str]) -> None: ...
 
     async def create_signed_url(self, path: str, expires_in: int, download_name: str) -> str: ...
+
+    async def list_objects(self, prefix: str = "") -> list["StoredObject"]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class StoredObject:
+    path: str
+    created_at: datetime | None
 
 
 def encode_path(path: str) -> str:
@@ -193,8 +203,62 @@ class SupabaseStorage:
         # rendering it, which also keeps an uploaded file from running as a page.
         return f"{self._storage_url}{signed_path}&download={quote(download_name, safe='')}"
 
+    async def list_objects(self, prefix: str = "") -> list[StoredObject]:
+        """Every object under `prefix`, recursively, for audits. Raises rather than return a
+        partial list, so an audit never mistakes an unread folder for a missing file."""
+        await self._ensure_private_bucket()
+        found: list[StoredObject] = []
+        folders = [prefix.strip("/")]
+        while folders:
+            folder = folders.pop()
+            offset = 0
+            while True:
+                response = await self._request(
+                    "POST",
+                    f"{self._storage_url}/object/list/{self._bucket}",
+                    json={
+                        "prefix": folder,
+                        "limit": LIST_PAGE,
+                        "offset": offset,
+                        "sortBy": {"column": "name", "order": "asc"},
+                    },
+                )
+                if response.status_code != 200:
+                    raise self._fail("list", response)
+                entries = response.json()
+                if not isinstance(entries, list):
+                    logger.error("Storage list returned an unexpected body")
+                    raise StorageError()
+                for entry in entries:
+                    name = entry.get("name") if isinstance(entry, dict) else None
+                    if not isinstance(name, str) or not name:
+                        continue
+                    path = f"{folder}/{name}" if folder else name
+                    if entry.get("id") is None:  # a folder
+                        folders.append(path)
+                    else:
+                        created = entry.get("created_at")
+                        found.append(StoredObject(path, _timestamp(created)))
+                if len(entries) < LIST_PAGE:
+                    break
+                offset += LIST_PAGE
+        return found
+
     async def aclose(self) -> None:
         await self._client.aclose()
+
+
+LIST_PAGE = 1000
+
+
+def _timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 @lru_cache

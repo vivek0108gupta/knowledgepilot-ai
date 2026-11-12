@@ -189,6 +189,8 @@ async def summary(
         period_end=end,
         currency=pricing.currency,
         pricing_version=pricing.version,
+        pricing_effective_from=pricing.effective_from,
+        pricing_verified_on=pricing.verified_on,
         totals=UsageTotals(**_totals(total[0], total[1], total[2])),
         by_operation=[
             OperationUsage(operation=r[0], **_totals(r[1], r[2], r[3])) for r in by_operation

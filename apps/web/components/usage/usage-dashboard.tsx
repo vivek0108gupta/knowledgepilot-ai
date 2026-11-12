@@ -212,7 +212,7 @@ const STATUS_LABELS = {
 const SOURCE_LABELS = {
   provider: "Reported by the provider",
   estimated: "Estimated",
-  unavailable: "Unknown (reserved amount)",
+  unavailable: "Held (outcome unknown)",
   none: "Not billed",
 } as const;
 
@@ -373,6 +373,16 @@ function RecordedAlerts({ workspaceId }: { workspaceId: string }) {
   );
 }
 
+/** Which prices the estimates use, and how current they are. */
+function pricingNote(summary: UsageSummary): string {
+  const dates = [
+    summary.pricing_effective_from && `prices effective ${summary.pricing_effective_from}`,
+    summary.pricing_verified_on && `last checked ${summary.pricing_verified_on}`,
+  ].filter(Boolean);
+  const when = dates.length ? `, ${dates.join(", ")}` : "";
+  return `Costs are estimates from price table ${summary.pricing_version} (${summary.currency}${when}), not an invoice.`;
+}
+
 function Overview({ summary }: { summary: UsageSummary }) {
   const { allowance: a, my_allowance: me, currency } = summary;
   const warnings = quotaWarnings(summary);
@@ -474,7 +484,7 @@ function Overview({ summary }: { summary: UsageSummary }) {
       )}
 
       <p className="text-xs text-zinc-500">
-        Costs are estimates from price table {summary.pricing_version} ({currency}), not an invoice.
+        {pricingNote(summary)} Totals include usage held while an outcome is unknown (see above).
         {summary.estimated_records + summary.unavailable_records > 0 &&
           ` ${formatTokens(summary.estimated_records + summary.unavailable_records)} records were estimated or charged at their reserved amount because the provider reported no usage (for example a stopped answer).`}{" "}
         Limits reset at midnight UTC (yours) and on the first of the month (the workspace&apos;s).{" "}

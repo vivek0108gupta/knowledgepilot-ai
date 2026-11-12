@@ -35,7 +35,7 @@ import socket
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import delete, func, select, text, update
+from sqlalchemy import Integer, delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -58,6 +58,9 @@ from app.services.processing import (
 logger = logging.getLogger(__name__)
 
 QUEUED, RUNNING = JobStatus.QUEUED.value, JobStatus.RUNNING.value
+# Shutdown: how long cancelled jobs may take to stop, and to hand them back.
+CANCEL_WAIT_SECONDS = 5.0
+RELEASE_TIMEOUT_SECONDS = 5.0
 # How many candidates one claim looks at before giving up for this round.
 CLAIM_CANDIDATES = 20
 GAVE_UP = "Processing failed repeatedly. Retry the document to try again."
@@ -235,6 +238,78 @@ async def complete(
     return status
 
 
+async def release_jobs(session: AsyncSession, worker: str, job_ids: list[uuid.UUID]) -> int:
+    """Hand jobs this worker is giving up (because it is shutting down) back to the queue at
+    once, without charging an attempt: the work was interrupted, not failed."""
+    if not job_ids:
+        return 0
+    # Never wait long on a row another transaction holds: the lease is the fallback.
+    await session.execute(text("SET LOCAL lock_timeout = '3s'"))
+    now = datetime.now(UTC)
+    released = (
+        (
+            await session.execute(
+                update(IngestionJob)
+                .where(
+                    IngestionJob.id.in_(job_ids),
+                    IngestionJob.status == RUNNING,
+                    IngestionJob.lease_owner == worker,
+                )
+                .values(
+                    status=QUEUED,
+                    # The attempt number stays (each attempt's usage key is unique); the
+                    # attempt is given back by raising the limit, so it costs nothing.
+                    max_attempts=IngestionJob.max_attempts + 1,
+                    lease_owner=None,
+                    leased_until=None,
+                    available_at=now,
+                    last_error="worker_shutdown",
+                    updated_at=now,
+                )
+                .returning(IngestionJob.document_id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if released:
+        # Ready for the next attempt, which removes any chunks this one left.
+        await session.execute(
+            update(Document)
+            .where(Document.id.in_(released), Document.status == DocumentStatus.PROCESSING.value)
+            .values(status=DocumentStatus.UPLOADED.value, updated_at=now)
+        )
+    await session.commit()
+    return len(released)
+
+
+async def enqueue_missing(
+    session: AsyncSession, *, older_than: timedelta = timedelta(minutes=1)
+) -> int:
+    """Give a job to every document waiting without one (for example from before jobs
+    existed, or if its job could not be written). Idempotent."""
+    settings = get_settings()
+    cutoff = datetime.now(UTC) - older_than
+    active = (
+        select(IngestionJob.id)
+        .where(IngestionJob.document_id == Document.id, IngestionJob.status.in_([QUEUED, RUNNING]))
+        .exists()
+    )
+    waiting = select(
+        Document.id, Document.workspace_id, func.cast(settings.ingestion_max_attempts, Integer)
+    ).where(Document.status == DocumentStatus.UPLOADED.value, Document.updated_at < cutoff, ~active)
+    result = await session.execute(
+        insert(IngestionJob)
+        .from_select(["document_id", "workspace_id", "max_attempts"], waiting)
+        .on_conflict_do_nothing(index_elements=["document_id"], index_where=text(ACTIVE_JOB))
+    )
+    await session.commit()
+    added = result.rowcount or 0  # type: ignore[attr-defined]
+    if added:
+        logger.warning("Queued %d waiting document(s) that had no ingestion job", added)
+    return added
+
+
 async def recover_expired(session: AsyncSession, *, now: datetime | None = None) -> int:
     """Take back running jobs whose lease expired: their worker stopped. Requeued while
     attempts remain, failed (with the document) otherwise."""
@@ -321,6 +396,9 @@ class JobQueue:
         self._wake = asyncio.Event()
         self._worker = worker_name()
         self._tasks: set[asyncio.Task[None]] = set()
+        # Jobs this process is running, by task, so a shutdown can hand them back.
+        self._running: dict[asyncio.Task[None], uuid.UUID] = {}
+        self._stopping = False
         self._loop: asyncio.Task[None] | None = None
 
     def enqueue(self, document_id: uuid.UUID) -> None:
@@ -343,11 +421,12 @@ class JobQueue:
         async with self._session_factory() as session:
             await recover_expired(session)
             await usage.sweep_expired(session)
+            await enqueue_missing(session)
 
     async def run_available(self) -> int:
         """Start as many available jobs as there are free slots. Returns how many started."""
         started = 0
-        while not self._slots.locked():
+        while not self._slots.locked() and not self._stopping:
             async with self._session_factory() as session:
                 job = await claim_next(session, self._worker)
             if job is None:
@@ -356,7 +435,9 @@ class JobQueue:
             started += 1
             task = asyncio.create_task(self._run(job), name=f"ingest-{job.document_id}")
             self._tasks.add(task)
+            self._running[task] = job.id
             task.add_done_callback(self._tasks.discard)
+            task.add_done_callback(lambda done: self._running.pop(done, None))
         return started
 
     async def _run(self, job: IngestionJob) -> None:
@@ -397,11 +478,54 @@ class JobQueue:
         if self._loop is None:
             self._loop = asyncio.create_task(self._forever(), name="ingestion-worker")
 
-    async def stop(self) -> None:
+    async def stop(self, grace_seconds: float | None = None) -> None:
+        """Stop gracefully: claim nothing more, let running jobs finish for up to the grace
+        period, then cancel the rest and hand their jobs back to the queue at once, without
+        charging an attempt, so another process picks them up straight away rather than
+        after their lease expires."""
+        self._stopping = True
         if self._loop is not None:
             self._loop.cancel()
             await asyncio.gather(self._loop, return_exceptions=True)
             self._loop = None
+        grace = (
+            get_settings().ingestion_shutdown_grace_seconds
+            if grace_seconds is None
+            else grace_seconds
+        )
+        running = dict(self._running)
+        if not running:
+            return
+        _done, pending = await asyncio.wait(list(running), timeout=grace)
+        if not pending:
+            return
+        for task in pending:
+            task.cancel()
+        # Bounded: a task that does not finish cancelling (stuck in a network call, say)
+        # must not hold the process up.
+        stopped, still_running = await asyncio.wait(pending, timeout=CANCEL_WAIT_SECONDS)
+        if still_running:
+            # Not handed back: its task may still write, so another worker must not start
+            # the same document meanwhile. Its lease expires and it is recovered then.
+            logger.warning(
+                "Shutdown: %d ingestion job(s) did not stop; they will be recovered when "
+                "their lease expires",
+                len(still_running),
+            )
+        if not stopped:
+            return
+        try:
+            async with self._session_factory() as session:
+                released = await asyncio.wait_for(
+                    release_jobs(session, self._worker, [running[task] for task in stopped]),
+                    RELEASE_TIMEOUT_SECONDS,
+                )
+            logger.info(
+                "Shutdown: handed %d unfinished ingestion job(s) back to the queue", released
+            )
+        except Exception:
+            # Their leases will expire and they will be recovered.
+            logger.exception("Shutdown: could not hand unfinished jobs back")
 
     async def drain(self) -> None:
         """Wait for work started so far. Used in tests."""

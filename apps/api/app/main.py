@@ -9,7 +9,7 @@ from app.api.v1.router import api_router
 from app.core.config import get_settings
 from app.core.errors import register_error_handlers
 from app.core.logging import configure_logging
-from app.core.middleware import REQUEST_ID_HEADER, request_context
+from app.core.middleware import REQUEST_ID_HEADER, BodySizeLimit, request_context
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +50,16 @@ def create_app() -> FastAPI:
     settings = get_settings()
     configure_logging(settings.log_level)
 
-    app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
+    docs = settings.docs_enabled
+    app = FastAPI(
+        title=settings.app_name,
+        version="0.1.0",
+        lifespan=lifespan,
+        # The interactive docs describe every endpoint; production does not publish them.
+        docs_url="/docs" if docs else None,
+        redoc_url="/redoc" if docs else None,
+        openapi_url="/openapi.json" if docs else None,
+    )
 
     # Middleware added later wraps middleware added earlier, so CORS is outermost and its
     # headers are also present on error responses produced by `request_context`.
@@ -64,6 +73,8 @@ def create_app() -> FastAPI:
         expose_headers=[REQUEST_ID_HEADER, "Retry-After"],
     )
 
+    # Outermost: an oversized body is refused before anything else touches the request.
+    app.add_middleware(BodySizeLimit, max_bytes=settings.max_request_body_bytes)
     register_error_handlers(app)
     app.include_router(api_router)
     return app

@@ -345,6 +345,8 @@ async def expire_stale(
                 outcome=UsageOutcome.ABANDONED.value,
                 usage_source=(UsageSource.UNAVAILABLE if called else UsageSource.NONE).value,
                 error_code="reservation_expired",
+                pricing_version=pricing.version,
+                currency=pricing.currency,
                 charged_tokens=held,
                 estimated_cost=cost,
                 charged_cost=cost or Decimal(0),
@@ -647,6 +649,9 @@ async def finalize(
             status=outcome.status.value,
             usage_source=outcome.source.value,
             outcome=provider_outcome.value,
+            # The prices actually used, which may be newer than those at reservation.
+            pricing_version=pricing.version,
+            currency=pricing.currency,
             model=model,
             error_code=outcome.error_code,
             message_id=outcome.message_id,

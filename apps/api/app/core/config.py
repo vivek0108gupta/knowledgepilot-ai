@@ -1,7 +1,7 @@
 from decimal import Decimal
 from functools import lru_cache
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Default model prices for usage cost estimates: OpenAI's published list prices for the
@@ -11,6 +11,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 DEFAULT_PRICING = {
     "version": "openai-list-2025-04",
     "currency": "USD",
+    # When these prices took effect, and when they were last checked against
+    # https://developers.openai.com/api/docs/pricing (cached-input prices are not modelled).
+    "effective_from": "2025-04-14",
+    "verified_on": "2026-11-12",
     "models": {
         "gpt-4.1-mini": {"input_per_million": "0.40", "output_per_million": "1.60"},
         "text-embedding-3-small": {"input_per_million": "0.02", "output_per_million": "0"},
@@ -25,6 +29,10 @@ class Settings(BaseSettings):
 
     app_name: str = "KnowledgePilot AI"
     environment: str = "development"
+    # The interactive API docs (/docs, /redoc, /openapi.json). Off in production unless set.
+    api_docs_enabled: bool | None = None
+    # The largest request body any JSON endpoint accepts. Uploads have their own limit.
+    max_request_body_bytes: int = Field(default=1_048_576, ge=1024)
     log_level: str = "INFO"
 
     # Local default matches docker-compose.yml, which publishes Postgres on host port 5434.
@@ -147,11 +155,19 @@ class Settings(BaseSettings):
     ingestion_job_lease_seconds: int = Field(default=600, ge=30)
     ingestion_retry_delay_seconds: int = Field(default=30, ge=0)
     ingestion_poll_seconds: float = Field(default=5.0, gt=0)
+    # On shutdown, how long running jobs may finish before they are handed back to the queue.
+    ingestion_shutdown_grace_seconds: float = Field(default=5.0, ge=0)
 
     # Replaces the default price table (app/services/pricing.py) without a code change.
     # JSON: {"version": "...", "currency": "USD", "models": {"<model prefix>":
     # {"input_per_million": "0.40", "output_per_million": "1.60"}}}.
     usage_pricing_json: str = ""
+
+    @field_validator("api_docs_enabled", mode="before")
+    @classmethod
+    def blank_means_unset(cls, value: object) -> object:
+        # Compose and .env files pass an unset variable as "": that means "use the default".
+        return None if isinstance(value, str) and not value.strip() else value
 
     @model_validator(mode="after")
     def check_limits(self) -> "Settings":
@@ -168,6 +184,12 @@ class Settings(BaseSettings):
         if self.chat_max_output_tokens < 1 or self.chat_max_output_tokens > 32_768:
             raise ValueError("CHAT_MAX_OUTPUT_TOKENS must be between 1 and 32768")
         return self
+
+    @property
+    def docs_enabled(self) -> bool:
+        if self.api_docs_enabled is not None:
+            return self.api_docs_enabled
+        return self.environment.lower() != "production"
 
     @property
     def jwt_issuer(self) -> str:

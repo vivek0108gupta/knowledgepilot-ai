@@ -53,6 +53,8 @@ export const usageSummarySchema = z.object({
   period_end: z.string(),
   currency: z.string(),
   pricing_version: z.string(),
+  pricing_effective_from: z.string().nullable().optional(),
+  pricing_verified_on: z.string().nullable().optional(),
   totals: totalsSchema,
   by_operation: z.array(totalsSchema.extend({ operation: operationSchema })),
   by_model: z.array(totalsSchema.extend({ model: z.string() })),

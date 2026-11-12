@@ -570,6 +570,20 @@ See the [audit](docs/phase-5.5-reliability-audit.md),
 [architecture](docs/phase-5.5-architecture.md), [operations](docs/phase-5.5-operations.md) and
 [testing](docs/phase-5.5-testing.md) documents.
 
+## Production readiness (Phase 5.6)
+
+Before deploying, read the [deployment checklist](docs/phase-5.6-deployment-checklist.md). For
+incidents, backups and restores, storage audits and pricing changes, use the
+[operations runbook](docs/phase-5.6-operations-runbook.md). The findings and evidence are in
+the [production readiness audit](docs/phase-5.6-production-readiness-audit.md) and the
+[resilience testing report](docs/phase-5.6-resilience-testing.md).
+
+To find, and optionally remove, storage files that no document references:
+
+```bash
+python -m app.tools.storage_audit   # report only; see the runbook before using --delete
+```
+
 Refusals use `429` with `rate_limited`, `user_quota_exceeded`, `workspace_quota_exceeded`,
 `concurrent_generation_limit`, `workspace_busy` or `ingestion_busy`, a `retry_after_seconds`
 field and a `Retry-After` header. If limits cannot be checked, the request is refused with
