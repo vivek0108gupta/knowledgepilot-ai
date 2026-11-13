@@ -115,6 +115,8 @@ class UsageEvent(Base):
         ),
         Index("ix_usage_events_workspace_created", "workspace_id", "created_at"),
         Index("ix_usage_events_user_created", "user_id", "created_at"),
+        # The deployment-wide budget check sums usage over a period (migration 0009).
+        Index("ix_usage_events_created", "created_at"),
         Index(
             "ix_usage_events_open",
             "status",

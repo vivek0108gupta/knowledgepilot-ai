@@ -48,6 +48,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings, get_settings
 from app.core.errors import AppError
 from app.core.logging import request_id_var
+from app.core.metrics import metrics
 from app.models.usage import (
     GENERATIONS,
     AlertKind,
@@ -234,6 +235,86 @@ def user_quota_exceeded(what: str, now: datetime) -> AppError:
     )
 
 
+# Foreign keys of usage_events, and the error each one means when its target is gone. The
+# same codes and messages as the conversation, document and workspace services (which import
+# this module, so cannot be imported here).
+DELETED_SUBJECTS = {
+    "fk_usage_events_conversation_id_conversations": (
+        "conversation_not_found",
+        "Conversation not found.",
+    ),
+    "fk_usage_events_document_id_documents": ("document_not_found", "Document not found."),
+    "fk_usage_events_workspace_id_workspaces": ("workspace_not_found", "Workspace not found."),
+}
+FOREIGN_KEY_VIOLATION = "23503"
+
+
+def deleted_subject(error: IntegrityError) -> AppError | None:
+    """The 404 to report if `error` is a foreign-key violation: something the reservation
+    refers to was deleted concurrently. None for anything else (such as a duplicate key)."""
+    driver_error = error.orig
+    cause = getattr(driver_error, "__cause__", None)
+    sqlstate = getattr(driver_error, "sqlstate", None) or getattr(cause, "sqlstate", None)
+    if sqlstate != FOREIGN_KEY_VIOLATION:
+        return None
+    constraint = getattr(cause, "constraint_name", None) or getattr(
+        driver_error, "constraint_name", None
+    )
+    code, message = DELETED_SUBJECTS.get(constraint or "", ("not_found", "Not found."))
+    return AppError(404, code, message)
+
+
+def service_budget_exhausted(period: str, retry_after: int) -> AppError:
+    return AppError(
+        429,
+        "service_budget_exhausted",
+        f"This service has reached its AI usage budget for {period}. Please try again later.",
+        retry_after_seconds=retry_after,
+    )
+
+
+# One lock for the deployment-wide budget, taken after the user and workspace locks (the same
+# order in every reservation, so reservations cannot deadlock).
+GLOBAL_SUBJECT = uuid.UUID(int=0)
+
+
+async def check_global_budget(
+    session: AsyncSession, settings: Settings, cost: Decimal | None, now: datetime
+) -> None:
+    """Refuse once the whole deployment's estimated spend reaches its daily or monthly cap.
+
+    Reservations count at their reserved upper bound until they finish, exactly as for the
+    per-workspace limits, so concurrent requests cannot overshoot."""
+    daily, monthly = settings.global_daily_cost_limit, settings.global_monthly_cost_limit
+    if daily is None and monthly is None:
+        return
+    if cost is None:
+        # The cap is in money; a model missing from the price table cannot be checked.
+        logger.error("A deployment-wide budget is set but the model has no price; refusing")
+        raise usage_unavailable()
+    await lock(session, "global", GLOBAL_SUBJECT)
+    today, month = day_start(now), month_start(now)
+    row = (
+        await session.execute(
+            select(
+                func.coalesce(
+                    func.sum(UsageEvent.charged_cost).filter(UsageEvent.created_at >= today), 0
+                ),
+                func.coalesce(func.sum(UsageEvent.charged_cost), 0),
+            ).where(UsageEvent.created_at >= month)
+        )
+    ).one()
+    spent_today, spent_month = Decimal(row[0]), Decimal(row[1])
+    if daily is not None and spent_today + cost > daily:
+        logger.warning("Deployment-wide daily AI budget reached")
+        raise service_budget_exhausted(
+            "today", seconds_until(day_start(now) + timedelta(days=1), now)
+        )
+    if monthly is not None and spent_month + cost > monthly:
+        logger.warning("Deployment-wide monthly AI budget reached")
+        raise service_budget_exhausted("this month", seconds_until(next_month(now), now))
+
+
 def workspace_quota_exceeded(what: str, now: datetime) -> AppError:
     return AppError(
         429,
@@ -356,6 +437,7 @@ async def expire_stale(
         )
     if rows:
         logger.warning("Expired %d abandoned usage reservation(s)", len(rows))
+        metrics.inc("usage_reservations_expired_total", len(rows))
     return len(rows)
 
 
@@ -485,6 +567,7 @@ async def reserve(
         if cost is not None and workspace.cost_this_month + cost > limits.workspace_monthly_cost:
             raise workspace_quota_exceeded("spending", now)
         await check_member_quota(session, workspace_id, user_id, tokens, generation, now)
+        await check_global_budget(session, settings, cost, now)
 
         event_id = uuid.uuid4()
         await session.execute(
@@ -518,6 +601,12 @@ async def reserve(
         raise
     except IntegrityError as error:
         await session.rollback()
+        gone = deleted_subject(error)
+        if gone is not None:
+            # The conversation, document or workspace was deleted while this operation was
+            # starting: report it as gone, not as a duplicate.
+            logger.info("Reservation refused: its %s was deleted meanwhile", gone.code)
+            raise gone from error
         logger.warning("Refused a second reservation for one %s operation", operation.value)
         raise AppError(
             409, "duplicate_operation", "This operation is already being processed."
@@ -603,6 +692,7 @@ async def finalize(
         await session.execute(
             select(
                 UsageEvent.status,
+                UsageEvent.operation,
                 UsageEvent.model,
                 UsageEvent.reserved_input_tokens,
                 UsageEvent.reserved_output_tokens,
@@ -665,6 +755,24 @@ async def finalize(
     if commit:
         await session.commit()
     if recorded:
+        operation = row.operation
+        metrics.inc(
+            "usage_operations_total",
+            operation=operation,
+            status=outcome.status.value,
+            outcome=provider_outcome.value,
+            source=outcome.source.value,
+        )
+        metrics.inc(
+            "usage_tokens_total", values["charged_tokens"], operation=operation, model=model or "-"
+        )
+        if values.get("charged_cost") is not None:
+            metrics.inc(
+                "usage_cost_usd_total",
+                float(values["charged_cost"]),
+                operation=operation,
+                model=model or "-",
+            )
         logger.info(
             "Usage %s: %s, %s, %s, %d token(s)%s",
             reservation_id,

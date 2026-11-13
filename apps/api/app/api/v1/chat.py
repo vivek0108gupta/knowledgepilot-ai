@@ -1,3 +1,4 @@
+import asyncio
 import json
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -120,6 +121,69 @@ class EventStreamResponse(StreamingResponse):
             with anyio.CancelScope(shield=True):
                 await self._events.aclose()
                 await self._on_close()
+
+
+KEEPALIVE = ": keep-alive\n\n"
+
+
+class _Failed:
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+
+_END = object()
+
+
+async def with_keepalive(source: AsyncGenerator[str], interval: float) -> AsyncGenerator[str]:
+    """Pass `source` through, adding an SSE comment after `interval` seconds without an event.
+
+    Some proxies close a response that stays silent for long, which can happen before the
+    first word while the provider is retried. Clients ignore comment lines (the web app does).
+
+    `source` is consumed by one producer task from start to end, so it is always resumed in
+    the same task: the timeouts and cancel scopes inside it stay valid. Closing this
+    generator (the client left) cancels that task, exactly as it would have cancelled
+    `source` before."""
+    if interval <= 0:
+        async for item in source:
+            yield item
+        return
+    queue: asyncio.Queue[object] = asyncio.Queue(maxsize=1)
+    # Stopped through an anyio cancel scope, never Task.cancel(): the answer's own cleanup
+    # (releasing the conversation and its usage) runs in shielded scopes, which an anyio
+    # cancellation respects and a native one would cut short.
+    scope = anyio.CancelScope()
+
+    async def produce() -> None:
+        with scope:
+            try:
+                async for item in source:
+                    await queue.put(item)
+            except Exception as error:  # noqa: BLE001 - handed to the consumer to re-raise
+                await queue.put(_Failed(error))
+                return
+            finally:
+                with anyio.CancelScope(shield=True):
+                    await source.aclose()
+            await queue.put(_END)
+
+    producer = asyncio.create_task(produce(), name="sse-producer")
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), interval)
+            except TimeoutError:
+                yield KEEPALIVE
+                continue
+            if item is _END:
+                return
+            if isinstance(item, _Failed):
+                raise item.error
+            yield item  # type: ignore[misc]
+    finally:
+        scope.cancel()
+        with anyio.CancelScope(shield=True):
+            await producer
 
 
 def sse(event_id: int, name: str, data: dict[str, Any]) -> str:
@@ -253,4 +317,6 @@ async def chat_stream_endpoint(
         body.document_ids,
         settings,
     )
-    return EventStreamResponse(encode(stream), on_close=stream.close)
+    return EventStreamResponse(
+        with_keepalive(encode(stream), settings.sse_keepalive_seconds), on_close=stream.close
+    )

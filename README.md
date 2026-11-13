@@ -1,8 +1,99 @@
 # KnowledgePilot AI
 
-Upload documents, ask questions, and get answers grounded in those documents with citations back to the source page.
+**Ask questions about your documents and get answers you can check.** Every answer cites the
+document and page it came from, and if your files don't support an answer, it says so
+instead of guessing.
 
-Built so far: sign-up and sign-in with Supabase Auth, workspaces with owner, admin and member roles, document upload with text extraction, semantic search over documents, and private conversations in which questions are answered from the workspace's documents, with citations.
+**Live demo:** `<your-app>.vercel.app` (add the link after deploying) · **API:**
+`<your-service>.onrender.com/api/v1/health` · Hosted on free tiers; see
+[limitations](#free-demo-limitations).
+
+![KnowledgePilot AI answering a question with numbered citations](docs/images/app-chat-answer.jpg)
+
+## Features
+
+- **Grounded answers with verified citations.** Answers stream in, with numbered sources
+  (document and page). The server checks every quoted passage against what the model was
+  actually given, and drops citations it can't verify.
+- **Semantic search** over a workspace's PDF, DOCX and TXT files, with pgvector.
+- **Multi-tenant workspaces** with owner, admin and member roles. Outsiders get 404, not 403.
+- **Safe ingestion:** file types checked from their bytes, archive-bomb limits, a private
+  bucket, short-lived signed downloads, and page/paragraph locations kept for citations.
+- **Cost controls:** per-user and per-workspace rate limits and quotas, a deployment-wide
+  budget, and a usage dashboard where every number says whether it was reported, estimated
+  or held.
+- **Reliability:** a durable PostgreSQL job queue with leases and retries, graceful
+  shutdown, and crash recovery tested with `kill -9` under load.
+- **Operations:** operator-only metrics, JSON logs, encrypted backups verified by a restore,
+  a security review, and runbooks.
+
+| | |
+|---|---|
+| ![Source cards with document and page](docs/images/app-chat-citations.jpg) | ![Usage dashboard with quotas and costs](docs/images/app-usage-dashboard.jpg) |
+
+## Architecture
+
+![Request flow: browser, Next.js, FastAPI, PostgreSQL with pgvector, OpenAI, Supabase](docs/images/card-02-architecture.png)
+
+| Layer | Technology |
+|---|---|
+| Web | Next.js 16 (App Router), React 19, TypeScript, Tailwind CSS, TanStack Query, Zod |
+| API | FastAPI, Python 3.13, SQLAlchemy (async), Alembic, Pytest |
+| Data | PostgreSQL with pgvector (Supabase in the demo) |
+| Auth and files | Supabase Auth (ES256 JWTs), Supabase Storage (private bucket) |
+| AI | OpenAI Responses API (`gpt-6-luna`, strict JSON schema, `store: false`), `text-embedding-3-small` |
+| Demo hosting | Vercel Hobby (web), Render Free (API in Docker): ₹0/month hosting |
+
+## Engineering decisions
+
+- **RAG with verification, not just retrieval.** Retrieval narrows what the model sees;
+  verification checks what it says. Quotes must match the retrieved passages, documents are
+  fenced off as untrusted data (against prompt injection), and the model has no tools.
+- **pgvector instead of a separate vector database.** Vectors live next to the data they
+  belong to: one database, one backup, one set of access rules, and transactions that cover
+  both.
+- **Multi-tenancy in every query.** Membership is checked in every query, not only at the
+  door. Tests skip the first check on purpose to prove the next one holds.
+- **JWT verification with public keys.** The API checks Supabase's ES256 tokens against the
+  project's JWKS. It holds no shared secret, and refuses symmetric algorithms.
+- **SSE for streaming.** It's one-way, works with plain HTTP and proxies, and is read with
+  `fetch()` so the request can carry a body and an `Authorization` header. Keep-alive
+  comments keep quiet streams open; a Stop and a lost connection are recorded differently.
+- **A durable queue in PostgreSQL.** `SELECT … FOR UPDATE SKIP LOCKED` claims, leases and
+  bounded retries, with no extra broker. A crashed worker's job is resumed by another
+  process, and never indexed twice.
+- **Usage accounting before the call.** The most an operation can cost is reserved, under a
+  lock, before the provider is called, so concurrent requests can't overspend. Afterwards
+  it's reconciled with what the provider reported.
+- **Retry and recovery everywhere.** Bounded retries with backoff for provider calls, lease
+  recovery for jobs, sweeps for abandoned reservations, and a model fallback if the
+  configured model disappears.
+
+Details: [model evaluation](docs/phase-5.7-model-evaluation.md),
+[security review](docs/phase-5.7-security-review.md),
+[load testing](docs/phase-5.7-load-testing.md),
+[backups](docs/phase-5.7-backup-strategy.md),
+[observability](docs/phase-5.7-observability.md),
+[free deployment](docs/phase-5.8a-free-portfolio-deployment.md).
+
+## Free demo limitations
+
+- The API sleeps after 15 idle minutes; the first request then takes about a minute.
+- Documents are processed only while the API is awake (queued work resumes on wake).
+- The Supabase project pauses after a week without activity.
+- AI usage is capped per day and per month for the whole demo. Please upload **synthetic
+  or public** documents only.
+- Single instance, no scheduled backups: it's a demo, not a production deployment. The
+  production design is in the [deployment runbook](docs/phase-5.7-deployment-runbook.md).
+
+## API documentation
+
+The interactive OpenAPI docs are switched off in production. Run the stack locally
+(`docker compose up --build`) and open http://localhost:8000/docs.
+
+---
+
+# Technical documentation
 
 ## Requirements
 
@@ -528,7 +619,7 @@ Every event has an increasing `id`. A stream ends after `message_completed` or `
 
 ### OpenAI configuration
 
-`OPENAI_API_KEY` (server only) and `OPENAI_CHAT_MODEL` (default `gpt-4.1-mini`). No code names a model: change the setting to change models. Requests use the Responses API with a strict JSON schema, `temperature` 0.2, at most 1,000 output tokens, and `store: false`, so conversations are not kept on OpenAI's side. Every answer stores the model that produced it, its token counts and `PROMPT_VERSION`; none of these, nor retrieval scores, are returned to clients. Neither questions, documents, answers nor the key are logged, only IDs, counts and error types.
+`OPENAI_API_KEY` (server only) and `OPENAI_CHAT_MODEL` (default `gpt-6-luna`, chosen in [Phase 5.7](docs/phase-5.7-model-evaluation.md); `gpt-4.1-mini` shuts down on 2027-01-14). No code names a model: change the setting to change models. Each model is sent only the parameters it accepts (`temperature` from `CHAT_TEMPERATURE`, `reasoning.effort` from `CHAT_REASONING_EFFORT`, default `low`). If the model is reported as not found, the request is retried once on `OPENAI_CHAT_FALLBACK_MODEL` (default `gpt-5.4-mini`). Requests use the Responses API with a strict JSON schema, at most 1,000 output tokens, and `store: false`, so conversations are not kept on OpenAI's side. Every answer stores the model that produced it, its token counts and `PROMPT_VERSION`; none of these, nor retrieval scores, are returned to clients. Neither questions, documents, answers nor the key are logged, only IDs, counts and error types.
 
 ### Limitations of answering
 
@@ -588,6 +679,22 @@ Refusals use `429` with `rate_limited`, `user_quota_exceeded`, `workspace_quota_
 `concurrent_generation_limit`, `workspace_busy` or `ingestion_busy`, a `retry_after_seconds`
 field and a `Retry-After` header. If limits cannot be checked, the request is refused with
 `503 usage_unavailable`; it is never run unchecked.
+
+## Launch preparation (Phase 5.7)
+
+- [Model evaluation](docs/phase-5.7-model-evaluation.md): the move from `gpt-4.1-mini` to
+  `gpt-6-luna`, per-model parameters, the fallback and rollback. Re-run with
+  `python -m app.tools.model_eval --model <name>[:effort]` (10 small real calls).
+- [Observability](docs/phase-5.7-observability.md): `GET /metrics` (set `METRICS_TOKEN`),
+  `LOG_FORMAT=json`, suggested alerts.
+- [Backup strategy](docs/phase-5.7-backup-strategy.md): encrypted, restore-verified database
+  backups (`python -m app.tools.db_backup`), file backups (`python -m app.tools.storage_backup`)
+  and `scripts/backup/nightly.sh`.
+- [Load testing](docs/phase-5.7-load-testing.md): `scripts/loadtest/run.py`, local stand-ins
+  only.
+- [Security review](docs/phase-5.7-security-review.md): threat model and checklist.
+- [Deployment runbook](docs/phase-5.7-deployment-runbook.md): staging and production,
+  migrations, rollback, TLS, incidents.
 
 ## Configuration
 

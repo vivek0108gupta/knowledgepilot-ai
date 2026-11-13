@@ -10,6 +10,7 @@ neither is the API key.
 import asyncio
 import logging
 import math
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from functools import lru_cache
@@ -20,6 +21,7 @@ from openai import AsyncOpenAI
 
 from app.core.config import get_settings
 from app.core.errors import AppError
+from app.core.metrics import metrics
 from app.models.chunk import EMBEDDING_DIMENSIONS
 from app.services.openai_client import TRANSIENT_ERRORS, backoff_delay, openai_client
 
@@ -112,6 +114,20 @@ class OpenAIEmbedder:
         return Embedded([vectors[text] for text in texts], tokens)
 
     async def _embed_batch(self, batch: list[str]) -> tuple[list[list[float]], int | None]:
+        started = time.perf_counter()
+        try:
+            result = await self._embed_attempts(batch)
+        except EmbeddingError as error:
+            metrics.inc(
+                "embedding_requests_total", outcome="retryable" if error.retryable else "failed"
+            )
+            raise
+        finally:
+            metrics.observe("embedding_duration_seconds", time.perf_counter() - started)
+        metrics.inc("embedding_requests_total", outcome="ok")
+        return result
+
+    async def _embed_attempts(self, batch: list[str]) -> tuple[list[list[float]], int | None]:
         for attempt in range(1, self._max_attempts + 1):
             try:
                 return await self._request(batch)

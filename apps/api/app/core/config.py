@@ -9,17 +9,43 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # estimates (no discounts, cached input or later price changes); replace them, with a new
 # version label, through USAGE_PRICING_JSON. See app/services/pricing.py.
 DEFAULT_PRICING = {
-    "version": "openai-list-2025-04",
+    # A new version whenever the table changes; recorded usage keeps the version it used.
+    "version": "openai-list-2026-11",
     "currency": "USD",
-    # When these prices took effect, and when they were last checked against
+    # When this table took effect, and when it was last checked against
     # https://developers.openai.com/api/docs/pricing (cached-input prices are not modelled).
-    "effective_from": "2025-04-14",
+    "effective_from": "2026-11-12",
     "verified_on": "2026-11-12",
     "models": {
         "gpt-4.1-mini": {"input_per_million": "0.40", "output_per_million": "1.60"},
+        # Candidates evaluated in Phase 5.7 (list prices checked 2026-11-12).
+        "gpt-5.4-mini": {"input_per_million": "0.75", "output_per_million": "4.50"},
+        "gpt-5.6-luna": {"input_per_million": "0.20", "output_per_million": "1.20"},
+        "gpt-6-luna": {"input_per_million": "0.10", "output_per_million": "0.50"},
         "text-embedding-3-small": {"input_per_million": "0.02", "output_per_million": "0"},
     },
 }
+
+
+# Request parameters each evaluated chat model accepts (docs/phase-5.7-model-evaluation.md).
+# Checked against the live API on 2026-11-12: gpt-6-luna and gpt-5.6-luna reject
+# `temperature`; gpt-4.1-mini rejects `reasoning`. A model not listed (matched by the longest
+# listed prefix) is sent neither, which every model accepts.
+CHAT_MODEL_CAPABILITIES: dict[str, dict[str, bool]] = {
+    "gpt-4.1-mini": {"temperature": True, "reasoning_effort": False},
+    "gpt-5.4-mini": {"temperature": True, "reasoning_effort": True},
+    "gpt-5.6-luna": {"temperature": False, "reasoning_effort": True},
+    "gpt-6-luna": {"temperature": False, "reasoning_effort": True},
+}
+
+REASONING_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
+
+
+def chat_model_capabilities(model: str) -> dict[str, bool]:
+    best = max(
+        (name for name in CHAT_MODEL_CAPABILITIES if model.startswith(name)), key=len, default=None
+    )
+    return CHAT_MODEL_CAPABILITIES.get(best, {}) if best else {}
 
 
 class Settings(BaseSettings):
@@ -63,6 +89,19 @@ class Settings(BaseSettings):
 
     # OpenAI, for embeddings. Server-only, like the storage key.
     openai_api_key: SecretStr = SecretStr("")
+    # Database connections per API process: a pool of DB_POOL_SIZE kept open, plus up to
+    # DB_MAX_OVERFLOW more under load. replicas x (size + overflow) must stay below the
+    # server's max_connections (docs/phase-5.7-load-testing.md); use a pooler beyond that.
+    db_pool_size: int = Field(default=5, ge=1, le=100)
+    db_max_overflow: int = Field(default=10, ge=0, le=100)
+    # Bearer token for GET /metrics (operators only). Empty: /metrics does not exist.
+    metrics_token: SecretStr = SecretStr("")
+    # A streamed answer sends an SSE comment after this many seconds without an event, so
+    # proxies do not close a quiet stream (for example while the provider is retried).
+    # 0 turns it off.
+    sse_keepalive_seconds: float = Field(default=15.0, ge=0)
+    # "text" (default) or "json": one JSON object per line, for log shippers.
+    log_format: str = "text"
     embedding_model: str = "text-embedding-3-small"
     # Must equal the size of the `document_chunks.embedding` column (1536).
     embedding_dimensions: int = 1536
@@ -73,10 +112,18 @@ class Settings(BaseSettings):
 
     # The chat model answers will be generated with. An identifier only: nothing calls it
     # yet, and no code names a model directly, so changing models is a setting change.
-    openai_chat_model: str = "gpt-4.1-mini"
+    # Chosen in Phase 5.7 (docs/phase-5.7-model-evaluation.md). Roll back by setting
+    # OPENAI_CHAT_MODEL=gpt-4.1-mini (until its shutdown on 2027-01-14) or gpt-5.4-mini.
+    openai_chat_model: str = "gpt-6-luna"
 
     # Answering questions from documents (retrieval-augmented generation).
     chat_temperature: float = 0.2
+    # For models that support it (see CHAT_MODEL_CAPABILITIES): how much the model reasons
+    # before answering; ignored for models that reject it. Empty: the model's own default.
+    chat_reasoning_effort: str | None = "low"
+    # Used once, automatically, if the configured model is reported as not found (for example
+    # after its shutdown date). Empty: no fallback. Also the rollback target.
+    openai_chat_fallback_model: str = "gpt-5.4-mini"
     chat_max_output_tokens: int = 1000
     chat_timeout_seconds: float = 45.0
     # The most a streamed answer may take from request to last word.
@@ -131,6 +178,11 @@ class Settings(BaseSettings):
     workspace_monthly_token_limit: int = Field(default=5_000_000, ge=1)
     # In the pricing table's currency. Checked against estimated cost, not an invoice.
     workspace_monthly_cost_limit: Decimal = Field(default=Decimal("10.00"), ge=0)
+    # Deployment-wide AI budget in USD (estimated from the price table), across every user and
+    # workspace. Unset: no deployment-wide cap. Set them for a public demo, where anyone can
+    # sign up and create workspaces (docs/phase-5.8a-free-portfolio-deployment.md).
+    global_daily_cost_limit: Decimal | None = Field(default=None, ge=0)
+    global_monthly_cost_limit: Decimal | None = Field(default=None, ge=0)
 
     # The most input a single answer may send to the model, as estimated before the call.
     chat_max_input_tokens: int = Field(default=12_000, ge=1000)
@@ -162,6 +214,20 @@ class Settings(BaseSettings):
     # JSON: {"version": "...", "currency": "USD", "models": {"<model prefix>":
     # {"input_per_million": "0.40", "output_per_million": "1.60"}}}.
     usage_pricing_json: str = ""
+
+    @field_validator("chat_reasoning_effort", mode="before")
+    @classmethod
+    def valid_effort(cls, value: object) -> object:
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        if value not in REASONING_EFFORTS:
+            raise ValueError(f"CHAT_REASONING_EFFORT must be one of {', '.join(REASONING_EFFORTS)}")
+        return value
+
+    @field_validator("global_daily_cost_limit", "global_monthly_cost_limit", mode="before")
+    @classmethod
+    def blank_limit_means_unset(cls, value: object) -> object:
+        return None if isinstance(value, str) and not value.strip() else value
 
     @field_validator("api_docs_enabled", mode="before")
     @classmethod

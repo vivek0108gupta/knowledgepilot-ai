@@ -334,7 +334,9 @@ class TestConfiguration:
     def test_defaults(self) -> None:
         settings = Settings()
 
-        assert settings.openai_chat_model == "gpt-4.1-mini"
+        assert Settings.model_fields["openai_chat_model"].default == "gpt-6-luna"
+        assert Settings.model_fields["openai_chat_fallback_model"].default == "gpt-5.4-mini"
+        assert Settings.model_fields["chat_reasoning_effort"].default == "low"
         assert (settings.chat_top_k, settings.chat_min_similarity) == (5, 0.2)
         assert (
             settings.chat_generation_lease_seconds

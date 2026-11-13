@@ -32,6 +32,7 @@ import asyncio
 import logging
 import os
 import socket
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -41,6 +42,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
+from app.core.metrics import metrics
 from app.models.document import Document, DocumentStatus
 from app.models.usage import ACTIVE_JOB, IngestionJob, JobStatus
 from app.services import usage
@@ -144,6 +146,10 @@ async def claim_next(
             .returning(IngestionJob)
         )
         await session.commit()
+        if job is not None:
+            metrics.observe(
+                "ingestion_queue_wait_seconds", max(0.0, (now - job.available_at).total_seconds())
+            )
         return job
     return None
 
@@ -235,6 +241,11 @@ async def complete(
     if values.get("last_error") == "attempts_exhausted":
         await fail_document(session, job.document_id, GAVE_UP)
     await session.commit()
+    metrics.inc(
+        "ingestion_jobs_finished_total",
+        status=status,
+        reason=values.get("last_error") or "indexed",
+    )
     return status
 
 
@@ -280,6 +291,7 @@ async def release_jobs(session: AsyncSession, worker: str, job_ids: list[uuid.UU
             .values(status=DocumentStatus.UPLOADED.value, updated_at=now)
         )
     await session.commit()
+    metrics.inc("ingestion_jobs_handed_back_total", len(released))
     return len(released)
 
 
@@ -350,6 +362,7 @@ async def recover_expired(session: AsyncSession, *, now: datetime | None = None)
     await session.commit()
     if stale:
         logger.warning("Recovered %d ingestion job(s) whose worker stopped", len(stale))
+        metrics.inc("ingestion_jobs_recovered_total", len(stale))
     return len(stale)
 
 
@@ -366,6 +379,7 @@ async def run_job(
         async with session_factory() as lease_session:
             await extend_lease(lease_session, job.id, worker)
 
+    started = time.perf_counter()
     result = await process_document(
         job.document_id,
         session_factory,
@@ -374,6 +388,9 @@ async def run_job(
         allow_retry=job.attempts < job.max_attempts,
         attempt_key=f"document_embedding:{job.id}:{job.attempts}",
         on_progress=keep_lease,
+    )
+    metrics.observe(
+        "ingestion_job_duration_seconds", time.perf_counter() - started, result=result.value
     )
     async with session_factory() as session:
         return await complete(session, job, worker, result)

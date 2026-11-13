@@ -8,6 +8,8 @@ from app.core.config import get_settings
 engine = create_async_engine(
     get_settings().database_url,
     pool_pre_ping=True,
+    pool_size=get_settings().db_pool_size,
+    max_overflow=get_settings().db_max_overflow,
     # Give up on a connection that is accepted but never completes, instead of holding a
     # request for asyncpg's default of a full minute.
     connect_args={"timeout": 10},

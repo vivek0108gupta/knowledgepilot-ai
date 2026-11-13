@@ -178,7 +178,7 @@ async def test_replicas_migrating_at_once_take_turns() -> None:
             host=url.host, port=url.port, user=url.username, password=url.password, database=name
         )
         try:
-            assert await check.fetchval("SELECT version_num FROM alembic_version") == "0008"
+            assert await check.fetchval("SELECT version_num FROM alembic_version") == "0009"
             assert await check.fetchval("SELECT count(*) FROM alembic_version") == 1
         finally:
             await check.close()
@@ -590,7 +590,7 @@ class TestPricingHistory:
         from app.core.config import DEFAULT_PRICING
 
         table = pricing.parse_pricing(DEFAULT_PRICING)
-        assert (table.effective_from, table.verified_on) == ("2025-04-14", "2026-11-12")
+        assert (table.effective_from, table.verified_on) == ("2026-11-12", "2026-11-12")
         with pytest.raises(pricing.PricingError):
             pricing.parse_pricing({**DEFAULT_PRICING, "verified_on": "last week"})
 
@@ -611,7 +611,7 @@ class TestPricingHistory:
         ).json()
 
         assert (summary["pricing_effective_from"], summary["pricing_verified_on"]) == (
-            "2025-04-14",
+            "2026-11-12",
             "2026-11-12",
         )
 

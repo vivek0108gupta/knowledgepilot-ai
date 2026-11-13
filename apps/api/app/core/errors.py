@@ -6,6 +6,7 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.logging import request_id_var
+from app.core.metrics import metrics
 
 
 class AppError(Exception):
@@ -58,6 +59,8 @@ def internal_error_response() -> JSONResponse:
 
 
 async def handle_app_error(_request: Request, error: AppError) -> JSONResponse:
+    # Quota and rate-limit refusals show here as their codes (workspace_quota_exceeded, ...).
+    metrics.inc("app_errors_total", code=error.code, status=error.status_code)
     response = error_response(
         error.status_code, error.code, error.message, retry_after_seconds=error.retry_after_seconds
     )

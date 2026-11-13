@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.metrics import router as metrics_router
 from app.api.v1.router import api_router
 from app.core.config import get_settings
 from app.core.errors import register_error_handlers
@@ -48,7 +49,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    configure_logging(settings.log_level)
+    configure_logging(settings.log_level, settings.log_format)
 
     docs = settings.docs_enabled
     app = FastAPI(
@@ -77,6 +78,7 @@ def create_app() -> FastAPI:
     app.add_middleware(BodySizeLimit, max_bytes=settings.max_request_body_bytes)
     register_error_handlers(app)
     app.include_router(api_router)
+    app.include_router(metrics_router)
     return app
 
 

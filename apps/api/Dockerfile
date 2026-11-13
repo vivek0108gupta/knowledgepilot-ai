@@ -29,4 +29,5 @@ USER api
 ENV PATH="/app/.venv/bin:$PATH"
 EXPOSE 8000
 # Apply pending migrations, then serve. `exec` makes uvicorn PID 1 so it receives stop signals.
-CMD ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+# Hosts such as Render say which port to listen on in PORT; otherwise 8000.
+CMD ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

@@ -12,7 +12,9 @@ Neither the instructions, the turns nor the output are ever logged, and neither 
 
 import asyncio
 import logging
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import aclosing
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Literal, Protocol
@@ -20,8 +22,9 @@ from typing import Any, Literal, Protocol
 import anyio
 import openai
 
-from app.core.config import get_settings
+from app.core.config import chat_model_capabilities, get_settings
 from app.core.errors import AppError
+from app.core.metrics import metrics
 from app.services.openai_client import TRANSIENT_ERRORS, backoff_delay, openai_client
 
 logger = logging.getLogger(__name__)
@@ -120,18 +123,23 @@ class OpenAIResponsesModel:
         client: openai.AsyncOpenAI,
         *,
         model: str,
-        temperature: float,
+        temperature: float | None,
         max_output_tokens: int,
         max_attempts: int = 3,
         base_delay_seconds: float = 1.0,
         stream_timeout_seconds: float = 120.0,
         sleep: Sleep = asyncio.sleep,
+        reasoning_effort: str | None = None,
+        fallback: "OpenAIResponsesModel | None" = None,
     ) -> None:
         if max_attempts < 1:
             raise ValueError("at least one attempt is required")
         self._client = client
         self._model = model
         self._temperature = temperature
+        self._reasoning_effort = reasoning_effort
+        # Tried once, for one request, when the configured model is reported as not found.
+        self._fallback = fallback
         self._max_output_tokens = max_output_tokens
         self._max_attempts = max_attempts
         self._base_delay = base_delay_seconds
@@ -153,10 +161,16 @@ class OpenAIResponsesModel:
                     "strict": True,
                 }
             },
-            "temperature": self._temperature,
             "max_output_tokens": self._max_output_tokens,
             # Do not keep the conversation on OpenAI's side.
             "store": False,
+            # Only what this model accepts (some reject `temperature`, others `reasoning`).
+            **({"temperature": self._temperature} if self._temperature is not None else {}),
+            **(
+                {"reasoning": {"effort": self._reasoning_effort}}
+                if self._reasoning_effort is not None
+                else {}
+            ),
         }
 
     def _permanent(self, error: openai.OpenAIError) -> LLMError:
@@ -164,19 +178,28 @@ class OpenAIResponsesModel:
         if isinstance(error, openai.APIStatusError):
             logger.error("Model request rejected with status %d", error.status_code)
             if error.status_code in MISCONFIGURED_STATUSES:
-                return LLMError(
+                failure = LLMError(
                     "The AI service rejected the server's configuration.",
                     code="misconfigured",
                     retryable=False,
                 )
+                failure.model_not_found = error.status_code == 404
+                return failure
             return LLMError(
                 "The AI service rejected the request.", code="rejected", retryable=False
             )
         logger.error("Model request failed: %s", type(error).__name__)
         return LLMError("The AI service returned an error.", code="unavailable", retryable=False)
 
+    def _record(self, mode: str, outcome: str, started: float) -> None:
+        metrics.inc("llm_requests_total", model=self._model, mode=mode, outcome=outcome)
+        metrics.observe(
+            "llm_duration_seconds", time.perf_counter() - started, model=self._model, mode=mode
+        )
+
     async def _before_retry(self, attempt: int, error: Exception) -> None:
         """Wait before the next attempt, or raise if this was the last one."""
+        metrics.inc("llm_retries_total", model=self._model, error=type(error).__name__)
         if attempt == self._max_attempts:
             logger.error(
                 "Model request failed after %d attempts: %s", attempt, type(error).__name__
@@ -197,6 +220,26 @@ class OpenAIResponsesModel:
     async def generate(
         self, *, instructions: str, turns: list[Turn], schema: dict[str, Any], schema_name: str
     ) -> Generation:
+        started = time.perf_counter()
+        try:
+            result = await self._generate(instructions, turns, schema, schema_name)
+            self._record("generate", "ok", started)
+            return result
+        except LLMError as error:
+            self._record("generate", error.code, started)
+            if not (self._fallback and getattr(error, "model_not_found", False)):
+                raise
+            metrics.inc("llm_fallbacks_total", model=self._model, fallback=self._fallback._model)
+            logger.error(
+                "Chat model %s not found; using fallback %s", self._model, self._fallback._model
+            )
+            return await self._fallback.generate(
+                instructions=instructions, turns=turns, schema=schema, schema_name=schema_name
+            )
+
+    async def _generate(
+        self, instructions: str, turns: list[Turn], schema: dict[str, Any], schema_name: str
+    ) -> Generation:
         request = self._request(instructions, turns, schema, schema_name)
         for attempt in range(1, self._max_attempts + 1):
             try:
@@ -211,6 +254,45 @@ class OpenAIResponsesModel:
 
     async def stream(
         self, *, instructions: str, turns: list[Turn], schema: dict[str, Any], schema_name: str
+    ) -> AsyncIterator[StreamEvent]:
+        """`_stream`, falling back once to the fallback model if the configured one is reported
+        as not found before any output."""
+        started = False
+        began = time.perf_counter()
+        outcome = "cancelled"  # unless it ends otherwise: the consumer stopped reading
+        try:
+            async with aclosing(self._stream(instructions, turns, schema, schema_name)) as inner:
+                async for item in inner:
+                    if not started:
+                        metrics.observe(
+                            "llm_first_token_seconds",
+                            time.perf_counter() - began,
+                            model=self._model,
+                        )
+                    started = True
+                    yield item
+            outcome = "ok"
+            return
+        except LLMError as error:
+            outcome = error.code
+            if started or not (self._fallback and getattr(error, "model_not_found", False)):
+                raise
+            metrics.inc("llm_fallbacks_total", model=self._model, fallback=self._fallback._model)
+            logger.error(
+                "Chat model %s not found; using fallback %s", self._model, self._fallback._model
+            )
+        finally:
+            self._record("stream", outcome, began)
+        async with aclosing(
+            self._fallback.stream(
+                instructions=instructions, turns=turns, schema=schema, schema_name=schema_name
+            )
+        ) as fallback:
+            async for item in fallback:
+                yield item
+
+    async def _stream(
+        self, instructions: str, turns: list[Turn], schema: dict[str, Any], schema_name: str
     ) -> AsyncIterator[StreamEvent]:
         """Stream the output. A failure before any text has been yielded is retried like
         `generate`; once text has been yielded, a failure ends the stream with an LLMError,
@@ -347,12 +429,28 @@ def get_chat_model() -> ChatModel:
     api_key = settings.openai_api_key.get_secret_value()
     if not api_key:
         raise ai_not_configured()
-    return OpenAIResponsesModel(
-        openai_client(api_key).with_options(timeout=settings.chat_timeout_seconds),
-        # The model is always a setting: no code names one.
-        model=settings.openai_chat_model,
-        temperature=settings.chat_temperature,
-        max_output_tokens=settings.chat_max_output_tokens,
-        max_attempts=settings.chat_max_attempts,
-        stream_timeout_seconds=settings.chat_stream_timeout_seconds,
+    client = openai_client(api_key).with_options(timeout=settings.chat_timeout_seconds)
+
+    def build(model: str, fallback: OpenAIResponsesModel | None = None) -> OpenAIResponsesModel:
+        accepts = chat_model_capabilities(model)
+        return OpenAIResponsesModel(
+            client,
+            # The model is always a setting: no code names one.
+            model=model,
+            temperature=settings.chat_temperature if accepts.get("temperature") else None,
+            reasoning_effort=settings.chat_reasoning_effort
+            if accepts.get("reasoning_effort")
+            else None,
+            max_output_tokens=settings.chat_max_output_tokens,
+            max_attempts=settings.chat_max_attempts,
+            stream_timeout_seconds=settings.chat_stream_timeout_seconds,
+            fallback=fallback,
+        )
+
+    fallback = (
+        build(settings.openai_chat_fallback_model)
+        if settings.openai_chat_fallback_model
+        and settings.openai_chat_fallback_model != settings.openai_chat_model
+        else None
     )
+    return build(settings.openai_chat_model, fallback)

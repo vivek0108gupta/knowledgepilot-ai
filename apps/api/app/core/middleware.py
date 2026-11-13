@@ -6,14 +6,44 @@ from collections.abc import Awaitable, Callable
 
 from fastapi import Request, Response
 
+from app.core.config import get_settings
 from app.core.errors import internal_error_response
 from app.core.logging import request_id_var
+from app.core.metrics import metrics
 
 logger = logging.getLogger("app.request")
 
 REQUEST_ID_HEADER = "X-Request-ID"
 # A caller-supplied ID is echoed into logs and headers, so only accept a safe, bounded one.
 SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+
+
+# The interactive docs (development only) load scripts and styles; nothing else is a page.
+DOCS_PATHS = ("/docs", "/redoc", "/openapi.json")
+API_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Cross-Origin-Resource-Policy": "same-site",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+}
+
+
+def apply_security_headers(path: str, response: Response) -> None:
+    """Hardening for a JSON API: nothing it returns may be framed, sniffed into another type,
+    run as a page or cached by a shared cache."""
+    for name, value in API_SECURITY_HEADERS.items():
+        response.headers.setdefault(name, value)
+    if not path.startswith(DOCS_PATHS):
+        response.headers.setdefault(
+            "Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'"
+        )
+    # Responses carry tenant data: never stored by browsers or proxies.
+    response.headers.setdefault("Cache-Control", "no-store")
+    if get_settings().environment.lower() == "production":
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+        )
 
 
 async def request_context(
@@ -32,7 +62,19 @@ async def request_context(
             logger.exception("Unhandled error on %s %s", request.method, request.url.path)
             response = internal_error_response()
 
-        duration_ms = (time.perf_counter() - started) * 1000
+        elapsed = time.perf_counter() - started
+        duration_ms = elapsed * 1000
+        # The route template ("/api/v1/workspaces/{workspace_id}"), never the concrete path.
+        route = getattr(request.scope.get("route"), "path", "unmatched")
+        metrics.inc(
+            "http_requests_total",
+            method=request.method,
+            route=route,
+            status=response.status_code,
+        )
+        metrics.observe(
+            "http_request_duration_seconds", elapsed, method=request.method, route=route
+        )
         logger.info(
             "%s %s -> %d in %.1fms",
             request.method,
@@ -41,6 +83,7 @@ async def request_context(
             duration_ms,
         )
         response.headers[REQUEST_ID_HEADER] = request_id
+        apply_security_headers(request.url.path, response)
         return response
     finally:
         request_id_var.reset(token)

@@ -534,7 +534,7 @@ class TestMessageConstraints:
 
 class TestNoModelCalls:
     def test_the_chat_model_is_a_setting_with_the_expected_default(self) -> None:
-        assert Settings().openai_chat_model == "gpt-4.1-mini"
+        assert Settings.model_fields["openai_chat_model"].default == "gpt-6-luna"
         assert (
             Settings(openai_chat_model="some-future-model").openai_chat_model == "some-future-model"
         )
