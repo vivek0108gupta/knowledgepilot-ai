@@ -282,3 +282,83 @@ class TestConcurrentDeletion:
             await reserve(session_factory, library, "same-key")
 
         assert (refused.value.status_code, refused.value.code) == (409, "duplicate_operation")
+
+
+class TestLifetimeLimits:
+    """2 searches and 2 questions per account, ever (the free demo's settings)."""
+
+    async def search(self, db_client, library: dict, user=None):  # noqa: ANN001, ANN201
+        from tests.auth import auth
+        from tests.test_conversations import API
+
+        return await db_client.post(
+            f"{API}/workspaces/{library['workspace']}/search",
+            json={"query": "refund policy"},
+            headers=auth(user or library["owner"]),
+        )
+
+    async def test_off_by_default(self) -> None:
+        settings = Settings(_env_file=None)
+        assert (settings.user_lifetime_search_limit, settings.user_lifetime_chat_limit) == (
+            None,
+            None,
+        )
+
+    async def test_the_third_search_is_refused(self, db_client, library: dict, budget) -> None:
+        budget(user_lifetime_search_limit=2)
+
+        assert (await self.search(db_client, library)).status_code == 200
+        assert (await self.search(db_client, library)).status_code == 200
+        refused = await self.search(db_client, library)
+
+        assert refused.status_code == 429
+        body = refused.json()["error"]
+        assert body["code"] == "lifetime_limit_reached"
+        assert "2 searches per account" in body["message"]
+        # Another user still has their own allowance.
+        assert (await self.search(db_client, library, library["member"])).status_code == 200
+
+    async def test_the_third_question_is_refused(self, db_client, library: dict, budget) -> None:
+        from tests.test_chat import ask
+
+        budget(user_lifetime_chat_limit=2)
+        conversation, owner = library["conversation"], library["owner"]
+
+        assert (await ask(db_client, conversation, owner, "refund policy")).status_code == 201
+        assert (await ask(db_client, conversation, owner, "shipping")).status_code == 201
+        refused = await ask(db_client, conversation, owner, "holidays")
+
+        assert refused.status_code == 429
+        assert refused.json()["error"]["code"] == "lifetime_limit_reached"
+        assert "2 questions per account" in refused.json()["error"]["message"]
+
+    async def test_a_chat_answers_own_search_step_is_not_a_search(
+        self, db_client, library: dict, budget
+    ) -> None:
+        from tests.test_chat import ask
+
+        budget(user_lifetime_search_limit=1)
+        for question in ("refund policy", "shipping"):
+            response = await ask(db_client, library["conversation"], library["owner"], question)
+            assert response.status_code == 201
+
+        # Both answers embedded their question; neither used the one explicit search.
+        assert (await self.search(db_client, library)).status_code == 200
+        assert (await self.search(db_client, library)).status_code == 429
+
+    async def test_exempt_users_are_not_limited(self, db_client, library: dict, budget) -> None:
+        budget(
+            user_lifetime_search_limit=0,
+            lifetime_limit_exempt_user_ids=f" {library['owner']} , {uuid.uuid4()}",
+        )
+
+        assert (await self.search(db_client, library)).status_code == 200
+        assert (await self.search(db_client, library, library["member"])).status_code == 429
+
+    def test_settings_are_validated(self) -> None:
+        assert Settings(user_lifetime_search_limit="").user_lifetime_search_limit is None
+        assert Settings(user_lifetime_chat_limit="2").user_lifetime_chat_limit == 2
+        with pytest.raises(ValueError, match="LIFETIME_LIMIT_EXEMPT_USER_IDS"):
+            Settings(lifetime_limit_exempt_user_ids="not-a-uuid")
+        with pytest.raises(ValueError):
+            Settings(user_lifetime_chat_limit="-1")

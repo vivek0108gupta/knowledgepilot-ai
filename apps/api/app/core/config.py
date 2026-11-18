@@ -1,3 +1,4 @@
+import uuid
 from decimal import Decimal
 from functools import lru_cache
 
@@ -183,6 +184,13 @@ class Settings(BaseSettings):
     # sign up and create workspaces (docs/phase-5.8a-free-portfolio-deployment.md).
     global_daily_cost_limit: Decimal | None = Field(default=None, ge=0)
     global_monthly_cost_limit: Decimal | None = Field(default=None, ge=0)
+    # Lifetime limits per account, for a public demo: explicit searches and chat questions a
+    # user may ever make. They never reset. Unset: no lifetime limit.
+    user_lifetime_search_limit: int | None = Field(default=None, ge=0)
+    user_lifetime_chat_limit: int | None = Field(default=None, ge=0)
+    # Comma-separated user IDs not subject to the lifetime limits (for example the demo's
+    # owner). User IDs are not secret.
+    lifetime_limit_exempt_user_ids: str = ""
 
     # The most input a single answer may send to the model, as estimated before the call.
     chat_max_input_tokens: int = Field(default=12_000, ge=1000)
@@ -224,10 +232,29 @@ class Settings(BaseSettings):
             raise ValueError(f"CHAT_REASONING_EFFORT must be one of {', '.join(REASONING_EFFORTS)}")
         return value
 
-    @field_validator("global_daily_cost_limit", "global_monthly_cost_limit", mode="before")
+    @field_validator(
+        "global_daily_cost_limit",
+        "global_monthly_cost_limit",
+        "user_lifetime_search_limit",
+        "user_lifetime_chat_limit",
+        mode="before",
+    )
     @classmethod
     def blank_limit_means_unset(cls, value: object) -> object:
         return None if isinstance(value, str) and not value.strip() else value
+
+    @field_validator("lifetime_limit_exempt_user_ids")
+    @classmethod
+    def valid_exempt_users(cls, value: str) -> str:
+        for raw in value.split(","):
+            if raw.strip():
+                try:
+                    uuid.UUID(raw.strip())
+                except ValueError as error:
+                    raise ValueError(
+                        "LIFETIME_LIMIT_EXEMPT_USER_IDS must be comma-separated user IDs (UUIDs)"
+                    ) from error
+        return value
 
     @field_validator("api_docs_enabled", mode="before")
     @classmethod
@@ -268,6 +295,14 @@ class Settings(BaseSettings):
         if self.supabase_jwks_url:
             return self.supabase_jwks_url
         return f"{self.jwt_issuer}/.well-known/jwks.json" if self.jwt_issuer else ""
+
+    @property
+    def lifetime_limit_exempt_users(self) -> frozenset[uuid.UUID]:
+        exempt = set()
+        for raw in self.lifetime_limit_exempt_user_ids.split(","):
+            if raw.strip():
+                exempt.add(uuid.UUID(raw.strip()))
+        return frozenset(exempt)
 
     @property
     def cors_origin_list(self) -> list[str]:

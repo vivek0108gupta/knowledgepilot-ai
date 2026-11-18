@@ -159,7 +159,12 @@ class TestContextBuilder:
         crowd = [match(f"Policy detail {n}.", 0.9 - n / 100, page_number=n) for n in range(5)]
         other = match("The other document's point.", 0.4, DOC_B, "other.pdf", page_number=1)
 
-        context = build_context([*crowd, other], token_budget=150, max_per_document=2)
+        # A fixed boundary (same length as the random one) and a budget with room for four of
+        # the six passages (221 of 240 tokens; a fifth needs 276). With a random boundary and
+        # 150 tokens, the boundary's token count alone made this fail about 6% of the time.
+        context = build_context(
+            [*crowd, other], token_budget=240, max_per_document=2, boundary="3f9a1c7e5b2d8046"
+        )
 
         names = [s.match.document_name for s in context.sources]
         assert "other.pdf" in names

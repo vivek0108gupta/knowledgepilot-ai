@@ -67,6 +67,15 @@ services:
         value: "0.50"
       - key: GLOBAL_MONTHLY_COST_LIMIT
         value: "3.00"
+      # Per account, ever (they never reset): 2 explicit searches and 2 chat questions.
+      - key: USER_LIFETIME_SEARCH_LIMIT
+        value: "2"
+      - key: USER_LIFETIME_CHAT_LIMIT
+        value: "2"
+      # Your own user ID (Settings page), so the owner can keep demoing. Comma-separated.
+      # sync: false, so a Blueprint sync never overwrites what you set in the dashboard.
+      - key: LIFETIME_LIMIT_EXEMPT_USER_IDS
+        sync: false
       - key: USER_DAILY_TOKEN_LIMIT
         value: "100000"
       - key: USER_DAILY_CHAT_LIMIT

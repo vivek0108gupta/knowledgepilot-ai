@@ -273,6 +273,55 @@ def service_budget_exhausted(period: str, retry_after: int) -> AppError:
     )
 
 
+def lifetime_limit_reached(what: str, limit: int) -> AppError:
+    return AppError(
+        429,
+        "lifetime_limit_reached",
+        f"This demo allows {limit} {what} per account, and you have used "
+        f"{'it' if limit == 1 else 'them'}. Thanks for trying KnowledgePilot AI!",
+    )
+
+
+async def check_lifetime_limits(
+    session: AsyncSession,
+    settings: Settings,
+    user_id: uuid.UUID,
+    operation: UsageOperation,
+    conversation_id: uuid.UUID | None,
+) -> None:
+    """Refuse once an account has used its lifetime allowance of searches or questions.
+
+    Runs under the user's lock (taken by `reserve`), so concurrent requests cannot exceed
+    it. Counts operations still running and every one that used, or may have used, the
+    provider (`charged_tokens > 0`); one refused or failed before any AI work does not count.
+    An explicit search is a query embedding without a conversation; the search step of a
+    chat answer belongs to its conversation and is covered by the question limit."""
+    generation = operation.value in GENERATIONS
+    search = operation == UsageOperation.QUERY_EMBEDDING and conversation_id is None
+    if generation:
+        limit, what = settings.user_lifetime_chat_limit, "questions"
+    elif search:
+        limit, what = settings.user_lifetime_search_limit, "searches"
+    else:
+        return
+    if limit is None or user_id in settings.lifetime_limit_exempt_users:
+        return
+    counted = or_(UsageEvent.status == RESERVED, UsageEvent.charged_tokens > 0)
+    kind = (
+        UsageEvent.operation.in_(GENERATIONS)
+        if generation
+        else and_(
+            UsageEvent.operation == UsageOperation.QUERY_EMBEDDING.value,
+            UsageEvent.conversation_id.is_(None),
+        )
+    )
+    used = await session.scalar(
+        select(func.count()).where(UsageEvent.user_id == user_id, kind, counted)
+    )
+    if (used or 0) >= limit:
+        raise lifetime_limit_reached(what if limit != 1 else what[:-1], limit)
+
+
 # One lock for the deployment-wide budget, taken after the user and workspace locks (the same
 # order in every reservation, so reservations cannot deadlock).
 GLOBAL_SUBJECT = uuid.UUID(int=0)
@@ -568,6 +617,7 @@ async def reserve(
             raise workspace_quota_exceeded("spending", now)
         await check_member_quota(session, workspace_id, user_id, tokens, generation, now)
         await check_global_budget(session, settings, cost, now)
+        await check_lifetime_limits(session, settings, user_id, operation, conversation_id)
 
         event_id = uuid.uuid4()
         await session.execute(

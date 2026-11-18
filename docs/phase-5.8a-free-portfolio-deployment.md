@@ -189,6 +189,7 @@ cron jobs or load balancers. The free subdomains are `*.vercel.app` and `*.onren
 | OpenAI project budget | Set a hard monthly budget in the OpenAI dashboard (for example $5) | The final backstop; applied by OpenAI |
 | **Deployment-wide cap (new)** | `GLOBAL_DAILY_COST_LIMIT=0.50`, `GLOBAL_MONTHLY_COST_LIMIT=3.00` | All users and workspaces together. New sign-ups don't get new budget. Refused with `429 service_budget_exhausted`. |
 | Per workspace | `WORKSPACE_MONTHLY_COST_LIMIT=1.00`, `WORKSPACE_MONTHLY_TOKEN_LIMIT=500000` | One workspace using everything |
+| **Per account, lifetime (new)** | `USER_LIFETIME_SEARCH_LIMIT=2`, `USER_LIFETIME_CHAT_LIMIT=2`; the owner exempt through `LIFETIME_LIMIT_EXEMPT_USER_IDS` | Each visitor gets 2 searches and 2 questions, ever (`429 lifetime_limit_reached`). With email confirmation off, new accounts get new allowances; the deployment-wide cap still bounds the total. |
 | Per user | `USER_DAILY_TOKEN_LIMIT=100000`, `USER_DAILY_CHAT_LIMIT=30` | One person using everything |
 | Rate limits | 5 answers/min, 20 searches/min, 5 uploads/hour per user | Bursts |
 | Concurrency | 3 answers per user; 3 ingestion jobs per workspace | Parallel abuse |
