@@ -198,6 +198,11 @@ How the cap works:
 - It is enforced **before** each provider call, under a database lock, counting in-flight
   operations at their reserved upper bound, so concurrent requests cannot overshoot.
 - A model missing from the price table is refused while a cap is set.
+- **The fallback model is off in the demo** (`OPENAI_CHAT_FALLBACK_MODEL` is empty in
+  `render.yaml`). Caps price each call at the configured model before it runs, and a
+  fallback to `gpt-5.4-mini` (about 7 to 9 times the price) would be charged only
+  afterwards, so it could overshoot them. If `gpt-6-luna` were ever removed, answers would
+  fail with `ai_misconfigured` until `OPENAI_CHAT_MODEL` is changed in Render.
 - Tested: a daily and a monthly cap stop the third operation; spending in one workspace
   counts against another; a real duplicate is still a 409.
 

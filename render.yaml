@@ -56,6 +56,13 @@ services:
       # --- Spending safeguards for a public demo (USD, estimated from list prices) ------
       # Hard stop for the whole deployment, whoever signs up. Also set a budget on the
       # OpenAI project itself: these limits are estimates, the provider's limit is final.
+      # No automatic fallback model in the demo. The caps price each call at the configured
+      # model before it runs; a fallback to a pricier model (gpt-5.4-mini costs about 7 to 9
+      # times gpt-6-luna) would be charged after the fact and could overshoot them. If the
+      # model is ever removed, answers fail with ai_misconfigured until OPENAI_CHAT_MODEL is
+      # changed (see docs/phase-5.7-model-evaluation.md, Rollback).
+      - key: OPENAI_CHAT_FALLBACK_MODEL
+        value: ""
       - key: GLOBAL_DAILY_COST_LIMIT
         value: "0.50"
       - key: GLOBAL_MONTHLY_COST_LIMIT
