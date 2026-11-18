@@ -30,38 +30,84 @@ export class ApiError extends Error {
   }
 }
 
+export interface ApiAuth {
+  /** The current access token, or null when signed out. */
+  getAccessToken: () => Promise<string | null>;
+  /** Called when the API rejects the token, so the app can end the session. */
+  onUnauthorized: () => void;
+}
+
+let apiAuth: ApiAuth | null = null;
+
+/** Connects the client to the auth session. Set once by `AuthProvider`; pass null to disconnect. */
+export function configureApiAuth(auth: ApiAuth | null): void {
+  apiAuth = auth;
+}
+
+export interface ApiRequest {
+  method?: "GET" | "POST" | "PATCH" | "DELETE";
+  /** Sent as JSON. */
+  body?: unknown;
+  signal?: AbortSignal;
+}
+
+/** Headers that identify the signed-in user to the API: the session's access token, if any. */
+export async function authHeaders(): Promise<Record<string, string>> {
+  const token = apiAuth ? await apiAuth.getAccessToken() : null;
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+/** The `ApiError` for a failed response. Ends the session when the API rejected the token. */
+export async function apiErrorFrom(response: Response): Promise<ApiError> {
+  const body: unknown = await response.json().catch(() => null);
+  return errorFor(response, body);
+}
+
+function errorFor(response: Response, body: unknown): ApiError {
+  const requestId = response.headers.get("X-Request-ID") ?? undefined;
+  if (response.status === 401) apiAuth?.onUnauthorized();
+  const envelope = errorEnvelopeSchema.safeParse(body);
+  if (envelope.success) {
+    const { code, message, request_id } = envelope.data.error;
+    return new ApiError(response.status, code, message, request_id ?? requestId);
+  }
+  return new ApiError(
+    response.status,
+    "unexpected_error",
+    `Request failed with status ${response.status}.`,
+    requestId,
+  );
+}
+
 /**
  * Calls a `/api/v1` endpoint and returns its JSON body, checked against `schema`.
+ * Sends the session's access token when there is one. The API works out who is calling from
+ * that token alone, so this client never sends a user ID to identify the caller.
  * Always rejects with an `ApiError`, except when the caller aborts the request.
  */
-export async function apiFetch<T>(path: string, schema: z.ZodType<T>, init?: RequestInit): Promise<T> {
+export async function apiFetch<T>(path: string, schema: z.ZodType<T>, request: ApiRequest = {}): Promise<T> {
+  const { method = "GET", body: payload, signal } = request;
+
+  const headers: Record<string, string> = { Accept: "application/json", ...(await authHeaders()) };
+  if (payload !== undefined) headers["Content-Type"] = "application/json";
+
   let response: Response;
   try {
     response = await fetch(`${API_V1}${path}`, {
-      ...init,
-      headers: { Accept: "application/json", ...init?.headers },
+      method,
+      headers,
+      body: payload === undefined ? undefined : JSON.stringify(payload),
+      signal,
     });
   } catch (cause) {
-    if (init?.signal?.aborted) throw cause;
+    if (signal?.aborted) throw cause;
     throw new ApiError(0, "network_error", "Could not reach the server.");
   }
 
-  const body: unknown = await response.json().catch(() => null);
+  const body: unknown = response.status === 204 ? undefined : await response.json().catch(() => null);
   const requestId = response.headers.get("X-Request-ID") ?? undefined;
 
-  if (!response.ok) {
-    const envelope = errorEnvelopeSchema.safeParse(body);
-    if (envelope.success) {
-      const { code, message, request_id } = envelope.data.error;
-      throw new ApiError(response.status, code, message, request_id ?? requestId);
-    }
-    throw new ApiError(
-      response.status,
-      "unexpected_error",
-      `Request failed with status ${response.status}.`,
-      requestId,
-    );
-  }
+  if (!response.ok) throw errorFor(response, body);
 
   const parsed = schema.safeParse(body);
   if (!parsed.success) {
@@ -76,12 +122,109 @@ export async function apiFetch<T>(path: string, schema: z.ZodType<T>, init?: Req
   return parsed.data;
 }
 
+/** A message safe to show a user for any thrown value. */
+export function errorMessage(error: unknown): string {
+  return error instanceof ApiError ? error.message : "Something went wrong. Please try again.";
+}
+
 export const healthSchema = z.object({ status: z.string() });
 export type Health = z.infer<typeof healthSchema>;
 
 export const readinessSchema = healthSchema.extend({ database: z.string(), pgvector: z.string() });
 export type Readiness = z.infer<typeof readinessSchema>;
 
-export const getHealth = (init?: RequestInit) => apiFetch("/health", healthSchema, init);
+export const getHealth = (signal?: AbortSignal) => apiFetch("/health", healthSchema, { signal });
 
-export const getReadiness = (init?: RequestInit) => apiFetch("/health/ready", readinessSchema, init);
+export const getReadiness = (signal?: AbortSignal) => apiFetch("/health/ready", readinessSchema, { signal });
+
+export interface UploadRequest {
+  /** Called with a number from 0 to 1 as the file is sent. */
+  onProgress?: (fraction: number) => void;
+  signal?: AbortSignal;
+}
+
+/**
+ * Sends a form (with files) to a `/api/v1` endpoint and returns the JSON body, checked against
+ * `schema`. Uses XMLHttpRequest because `fetch` cannot report upload progress.
+ * Rejects exactly like `apiFetch`: with an `ApiError`, or the abort reason if the caller aborts.
+ */
+export async function apiUpload<T>(
+  path: string,
+  schema: z.ZodType<T>,
+  form: FormData,
+  { onProgress, signal }: UploadRequest = {},
+): Promise<T> {
+  const token = apiAuth ? await apiAuth.getAccessToken() : null;
+
+  return new Promise<T>((resolve, reject) => {
+    const aborted = () => new DOMException("The upload was cancelled.", "AbortError");
+    if (signal?.aborted) {
+      reject(aborted());
+      return;
+    }
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `${API_V1}${path}`);
+    xhr.setRequestHeader("Accept", "application/json");
+    if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+    // No Content-Type: the browser sets it, including the multipart boundary.
+
+    const abort = () => xhr.abort();
+    signal?.addEventListener("abort", abort);
+    const finish = () => signal?.removeEventListener("abort", abort);
+
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable && event.total > 0) onProgress?.(event.loaded / event.total);
+    };
+    xhr.onabort = () => {
+      finish();
+      reject(aborted());
+    };
+    xhr.onerror = () => {
+      finish();
+      reject(new ApiError(0, "network_error", "Could not reach the server."));
+    };
+    xhr.onload = () => {
+      finish();
+      const requestId = xhr.getResponseHeader("X-Request-ID") ?? undefined;
+      let body: unknown = null;
+      try {
+        body = JSON.parse(xhr.responseText);
+      } catch {
+        // Not JSON (for example an error page from a proxy); handled below as unexpected.
+      }
+
+      if (xhr.status < 200 || xhr.status >= 300) {
+        if (xhr.status === 401) apiAuth?.onUnauthorized();
+        const envelope = errorEnvelopeSchema.safeParse(body);
+        reject(
+          envelope.success
+            ? new ApiError(
+                xhr.status,
+                envelope.data.error.code,
+                envelope.data.error.message,
+                envelope.data.error.request_id ?? requestId,
+              )
+            : new ApiError(
+                xhr.status,
+                "unexpected_error",
+                `Request failed with status ${xhr.status}.`,
+                requestId,
+              ),
+        );
+        return;
+      }
+
+      const parsed = schema.safeParse(body);
+      if (!parsed.success) {
+        reject(
+          new ApiError(xhr.status, "invalid_response", "The server sent an unexpected response.", requestId),
+        );
+        return;
+      }
+      resolve(parsed.data);
+    };
+
+    xhr.send(form);
+  });
+}

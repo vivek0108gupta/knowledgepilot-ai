@@ -22,7 +22,7 @@ const DOT: Record<Status, string> = {
 export function ApiStatus() {
   const { isPending, isError } = useQuery({
     queryKey: ["health", "ready"],
-    queryFn: ({ signal }) => getReadiness({ signal }),
+    queryFn: ({ signal }) => getReadiness(signal),
   });
 
   const status: Status = isPending ? "checking" : isError ? "offline" : "online";
@@ -30,7 +30,7 @@ export function ApiStatus() {
   return (
     <p
       role="status"
-      className="inline-flex items-center gap-2 rounded-full border border-zinc-200 px-3 py-1 text-sm text-zinc-700 dark:border-zinc-800 dark:text-zinc-300"
+      className="inline-flex items-center gap-2 rounded-full border border-zinc-200 px-3 py-1 text-sm text-zinc-700"
     >
       <span aria-hidden="true" className={`size-2 rounded-full ${DOT[status]}`} />
       {LABELS[status]}

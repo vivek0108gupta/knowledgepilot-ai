@@ -1,5 +1,7 @@
+import json
 import logging
 from contextvars import ContextVar
+from datetime import UTC, datetime
 from logging.config import dictConfig
 
 # Set per request by the middleware in app.core.middleware; "-" outside a request.
@@ -14,7 +16,24 @@ class RequestIdFilter(logging.Filter):
         return True
 
 
-def configure_logging(level: str = "INFO") -> None:
+class JsonFormatter(logging.Formatter):
+    """One JSON object per line. Carries exactly what the text format carries (the message is
+    already free of content and secrets), in fields a log shipper can index."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        entry = {
+            "time": datetime.fromtimestamp(record.created, UTC).isoformat(timespec="milliseconds"),
+            "level": record.levelname,
+            "logger": record.name,
+            "request_id": getattr(record, "request_id", "-"),
+            "message": record.getMessage(),
+        }
+        if record.exc_info:
+            entry["exception"] = self.formatException(record.exc_info)
+        return json.dumps(entry, ensure_ascii=False)
+
+
+def configure_logging(level: str = "INFO", log_format: str = "text") -> None:
     """Send all logs, including uvicorn's, to stdout in one format."""
     dictConfig(
         {
@@ -24,13 +43,14 @@ def configure_logging(level: str = "INFO") -> None:
             "formatters": {
                 "default": {
                     "format": "%(asctime)s %(levelname)s [%(request_id)s] %(name)s: %(message)s",
-                }
+                },
+                "json": {"()": JsonFormatter},
             },
             "handlers": {
                 "stdout": {
                     "class": "logging.StreamHandler",
                     "stream": "ext://sys.stdout",
-                    "formatter": "default",
+                    "formatter": "json" if log_format == "json" else "default",
                     "filters": ["request_id"],
                 }
             },
@@ -41,6 +61,12 @@ def configure_logging(level: str = "INFO") -> None:
                 "uvicorn.error": {"handlers": [], "propagate": True},
                 # The request middleware logs each request, so uvicorn's access log is redundant.
                 "uvicorn.access": {"handlers": [], "propagate": False},
+                # These log every outgoing request URL at INFO. Storage URLs contain file
+                # names, so only their warnings and errors are kept.
+                "httpx": {"level": "WARNING"},
+                "httpx2": {"level": "WARNING"},
+                "httpcore": {"level": "WARNING"},
+                "openai": {"level": "WARNING"},
             },
         }
     )

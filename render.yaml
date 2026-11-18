@@ -1,0 +1,85 @@
+# Render Blueprint for the FREE portfolio demo of the KnowledgePilot AI API.
+# Guide: docs/phase-5.8a-free-portfolio-deployment.md. Production architecture (several
+# replicas, managed backups, monitoring): docs/phase-5.7-deployment-runbook.md.
+#
+# Free instance: 512 MB RAM, 0.1 CPU; sleeps after 15 minutes without requests and takes
+# about a minute to wake. The ingestion workers run inside this one process (as they always
+# have), so documents are processed while it is awake; queued work resumes when it wakes.
+#
+# Secrets are `sync: false`: Render asks for them when the Blueprint is created, and they
+# live only in Render's environment settings, never in this repository.
+services:
+  - type: web
+    name: knowledgepilot-api
+    runtime: docker
+    plan: free
+    dockerfilePath: ./apps/api/Dockerfile
+    dockerContext: ./apps/api
+    # Liveness only: a sleeping or paused Supabase project must not make Render restart the
+    # API in a loop. Readiness (database + pgvector) is /api/v1/health/ready.
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: LOG_FORMAT
+        value: json
+      - key: LOG_LEVEL
+        value: INFO
+
+      # --- Secrets and per-deployment values: set in the Render dashboard -------------
+      # Supabase *session pooler* URL (IPv4, port 5432), in the form
+      # postgresql+asyncpg://postgres.<project-ref>:<password>@<pooler-host>:5432/postgres?ssl=require
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      # The Vercel production URL, for example https://knowledgepilot-ai.vercel.app
+      - key: CORS_ORIGINS
+        sync: false
+      - key: METRICS_TOKEN
+        generateValue: true
+      - key: SUPABASE_STORAGE_BUCKET
+        value: knowledgepilot-documents
+
+      # --- Free-tier sizing -------------------------------------------------------------
+      - key: PROCESSING_CONCURRENCY
+        value: "1"
+      - key: DB_POOL_SIZE
+        value: "3"
+      - key: DB_MAX_OVERFLOW
+        value: "2"
+
+      # --- Spending safeguards for a public demo (USD, estimated from list prices) ------
+      # Hard stop for the whole deployment, whoever signs up. Also set a budget on the
+      # OpenAI project itself: these limits are estimates, the provider's limit is final.
+      # No automatic fallback model in the demo. The caps price each call at the configured
+      # model before it runs; a fallback to a pricier model (gpt-5.4-mini costs about 7 to 9
+      # times gpt-6-luna) would be charged after the fact and could overshoot them. If the
+      # model is ever removed, answers fail with ai_misconfigured until OPENAI_CHAT_MODEL is
+      # changed (see docs/phase-5.7-model-evaluation.md, Rollback).
+      - key: OPENAI_CHAT_FALLBACK_MODEL
+        value: ""
+      - key: GLOBAL_DAILY_COST_LIMIT
+        value: "0.50"
+      - key: GLOBAL_MONTHLY_COST_LIMIT
+        value: "3.00"
+      - key: USER_DAILY_TOKEN_LIMIT
+        value: "100000"
+      - key: USER_DAILY_CHAT_LIMIT
+        value: "30"
+      - key: WORKSPACE_MONTHLY_TOKEN_LIMIT
+        value: "500000"
+      - key: WORKSPACE_MONTHLY_COST_LIMIT
+        value: "1.00"
+      - key: RATE_LIMIT_CHAT_PER_MINUTE
+        value: "5"
+      - key: RATE_LIMIT_SEARCH_PER_MINUTE
+        value: "20"
+      - key: RATE_LIMIT_UPLOAD_PER_HOUR
+        value: "5"
+      - key: MAX_INGESTION_JOBS_PER_WORKSPACE
+        value: "3"

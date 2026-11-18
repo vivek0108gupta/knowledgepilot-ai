@@ -1,0 +1,221 @@
+"""Semantic search over a workspace's document chunks.
+
+Tenant isolation is part of the SQL itself: the one query that reads chunks joins the
+caller's own membership row and filters on the workspace, so a chunk from another workspace
+cannot be returned whatever workspace or document IDs the caller sends.
+
+Chunk text is returned as data for display. It is never interpreted here, and anything that
+later feeds it to a language model must treat it as untrusted.
+"""
+
+import logging
+import uuid
+from dataclasses import dataclass
+
+import anyio
+from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import get_settings
+from app.core.errors import AppError
+from app.models.chunk import DocumentChunk
+from app.models.document import Document, DocumentStatus
+from app.models.usage import UsageOperation, UsageOutcome, UsageSource, UsageStatus
+from app.models.workspace import WorkspaceMember
+from app.services import rate_limits, usage
+from app.services import workspaces as workspace_service
+from app.services.embeddings import Embedder, EmbeddingError, embed_metered
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class Match:
+    """One search hit, as plain values that stay valid after the database session moves on."""
+
+    chunk_id: uuid.UUID
+    document_id: uuid.UUID
+    document_name: str
+    content: str
+    similarity: float
+    page_number: int | None
+    paragraph_index: int | None
+    line_start: int | None
+    line_end: int | None
+
+
+def embeddings_unavailable() -> AppError:
+    return AppError(503, "embeddings_unavailable", "Search is temporarily unavailable. Try again.")
+
+
+async def search(
+    session: AsyncSession,
+    embedder: Embedder,
+    workspace_id: uuid.UUID,
+    user_id: uuid.UUID,
+    query: str,
+    top_k: int,
+    document_ids: list[uuid.UUID],
+    min_similarity: float,
+) -> list[Match]:
+    # 404 for a workspace the caller is not in, before any text is sent to the embedding API.
+    await workspace_service.get_access(session, workspace_id, user_id)
+    await session.rollback()
+    await rate_limits.hit(session, rate_limits.search_per_user(get_settings()), user_id)
+
+    (query_vector,) = await embed_query(session, embedder, user_id, workspace_id, [query])
+
+    return await nearest(
+        session, workspace_id, user_id, query_vector, top_k, document_ids, min_similarity
+    )
+
+
+async def embed_query(
+    session: AsyncSession,
+    embedder: Embedder,
+    user_id: uuid.UUID,
+    workspace_id: uuid.UUID,
+    queries: list[str],
+    *,
+    conversation_id: uuid.UUID | None = None,
+    idempotency_key: str | None = None,
+) -> list[list[float]]:
+    """Embed search queries (all in one request), as a reserved operation: limits are
+    checked and the tokens reserved before the provider is called, so an exhausted quota
+    stops the call; the provider's count then replaces the reservation. Used by search and
+    by question answering (whose key ties it to the answer's own reservation)."""
+    settings = get_settings()
+    model = settings.embedding_model
+    estimate = sum(usage.count_tokens(query) for query in queries) + len(queries)
+    reservation = await usage.reserve(
+        session,
+        user_id=user_id,
+        workspace_id=workspace_id,
+        operation=UsageOperation.QUERY_EMBEDDING,
+        model=model,
+        input_tokens=estimate,
+        output_tokens=0,
+        idempotency_key=idempotency_key or f"query_embedding:{uuid.uuid4()}",
+        ttl_seconds=settings.query_reservation_ttl_seconds,
+        conversation_id=conversation_id,
+    )
+    await usage.mark_called(session, reservation.id, estimate)
+    try:
+        embedded = await embed_metered(embedder, queries)
+    except EmbeddingError as error:
+        logger.error("Query embedding failed (retryable: %s)", error.retryable)
+        # Refused outright: no work was done. Failed after retries: it may have run.
+        outcome = (
+            usage.Outcome(
+                UsageStatus.FAILED,
+                UsageSource.UNAVAILABLE,
+                error_code="embeddings_unavailable",
+                outcome=UsageOutcome.UNKNOWN,
+            )
+            if error.retryable
+            else usage.Outcome(
+                UsageStatus.FAILED,
+                UsageSource.NONE,
+                error_code="embeddings_unavailable",
+                outcome=UsageOutcome.REJECTED,
+            )
+        )
+        await usage.finalize(session, reservation.id, outcome)
+        raise embeddings_unavailable() from error
+    except BaseException:
+        # Cancelled (the client went away) with the call in flight: outcome unknown.
+        with anyio.CancelScope(shield=True):
+            await usage.finalize(
+                session,
+                reservation.id,
+                usage.Outcome(
+                    UsageStatus.CANCELLED,
+                    UsageSource.UNAVAILABLE,
+                    error_code="cancelled",
+                    outcome=UsageOutcome.UNKNOWN,
+                ),
+            )
+        raise
+    await usage.finalize(
+        session,
+        reservation.id,
+        usage.Outcome(UsageStatus.COMPLETED, UsageSource.PROVIDER, embedded.input_tokens, 0)
+        if embedded.input_tokens is not None
+        else usage.Outcome(UsageStatus.COMPLETED, UsageSource.ESTIMATED, estimate, 0),
+    )
+    return embedded.vectors
+
+
+async def nearest(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    user_id: uuid.UUID,
+    vector: list[float],
+    top_k: int,
+    document_ids: list[uuid.UUID],
+    min_similarity: float,
+) -> list[Match]:
+    """The chunks closest to `vector` in one workspace, from ready documents only.
+
+    Used by search and by question answering alike, so both get the same tenant isolation:
+    the caller's membership is part of the query itself.
+    """
+    distance = DocumentChunk.embedding.cosine_distance(vector)
+    statement = (
+        # Only the columns the response needs: never the vector, the workspace, or metadata.
+        select(
+            DocumentChunk.id,
+            DocumentChunk.document_id,
+            Document.filename,
+            DocumentChunk.content,
+            (1 - distance).label("similarity"),
+            DocumentChunk.page_number,
+            DocumentChunk.paragraph_index,
+            DocumentChunk.line_start,
+            DocumentChunk.line_end,
+        )
+        .join(Document, Document.id == DocumentChunk.document_id)
+        # The caller's membership is re-proved inside the query, so the result depends on
+        # the database's view at this instant and not on the check made above.
+        .join(
+            WorkspaceMember,
+            (WorkspaceMember.workspace_id == DocumentChunk.workspace_id)
+            & (WorkspaceMember.user_id == user_id),
+        )
+        .where(
+            DocumentChunk.workspace_id == workspace_id,
+            Document.workspace_id == workspace_id,
+            # Chunks of a document still being processed are incomplete and stay hidden.
+            Document.status == DocumentStatus.READY.value,
+        )
+        .order_by(distance)
+        .limit(top_k)
+    )
+    if document_ids:
+        # IDs from another workspace simply match nothing: the workspace filter still applies.
+        statement = statement.where(DocumentChunk.document_id.in_(document_ids))
+    if min_similarity > 0:
+        statement = statement.where(distance <= 1 - min_similarity)
+
+    # With a filter, an approximate index can find fewer than `top_k` matching rows in its
+    # first pass. Iterative scanning keeps going until enough rows pass the filter.
+    await session.execute(text("SET LOCAL hnsw.iterative_scan = 'strict_order'"))
+    rows = (await session.execute(statement)).all()
+    await session.rollback()
+
+    logger.info("Search in workspace %s returned %d result(s)", workspace_id, len(rows))
+    return [
+        Match(
+            chunk_id=row.id,
+            document_id=row.document_id,
+            document_name=row.filename,
+            content=row.content,
+            # Clamped: floating-point error can put an exact match a hair above 1.
+            similarity=round(max(-1.0, min(1.0, float(row.similarity))), 4),
+            page_number=row.page_number,
+            paragraph_index=row.paragraph_index,
+            line_start=row.line_start,
+            line_end=row.line_end,
+        )
+        for row in rows
+    ]

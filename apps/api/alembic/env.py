@@ -1,6 +1,7 @@
 import asyncio
 
 from alembic import context
+from sqlalchemy import text
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -26,10 +27,22 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
+# Several API replicas start together and each runs `alembic upgrade head`. This lock makes
+# them run one at a time: the first migrates, the others then find nothing to do.
+MIGRATION_LOCK = "SELECT pg_advisory_lock(hashtextextended('knowledgepilot-migrations', 0))"
+MIGRATION_UNLOCK = "SELECT pg_advisory_unlock(hashtextextended('knowledgepilot-migrations', 0))"
+
+
 def do_run_migrations(connection: Connection) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata)
-    with context.begin_transaction():
-        context.run_migrations()
+    connection.execute(text(MIGRATION_LOCK))
+    connection.commit()
+    try:
+        context.configure(connection=connection, target_metadata=target_metadata)
+        with context.begin_transaction():
+            context.run_migrations()
+    finally:
+        connection.execute(text(MIGRATION_UNLOCK))
+        connection.commit()
 
 
 async def run_migrations_online() -> None:

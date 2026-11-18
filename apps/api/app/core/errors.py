@@ -6,20 +6,39 @@ from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.logging import request_id_var
+from app.core.metrics import metrics
 
 
 class AppError(Exception):
     """An expected failure with a stable, machine-readable code the frontend can branch on."""
 
-    def __init__(self, status_code: int, code: str, message: str) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        headers: dict[str, str] | None = None,
+        *,
+        retry_after_seconds: int | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
         self.message = message
+        self.headers = dict(headers or {})
+        # When trying again can succeed after a wait, how long to wait. Sent both as a
+        # `Retry-After` header and in the error body, which browsers can always read.
+        self.retry_after_seconds = retry_after_seconds
+        if retry_after_seconds is not None:
+            self.headers["Retry-After"] = str(retry_after_seconds)
 
 
 def error_response(
-    status_code: int, code: str, message: str, details: list[dict[str, object]] | None = None
+    status_code: int,
+    code: str,
+    message: str,
+    details: list[dict[str, object]] | None = None,
+    retry_after_seconds: int | None = None,
 ) -> JSONResponse:
     """Every error leaves the API in this one shape."""
     error: dict[str, object] = {
@@ -29,6 +48,8 @@ def error_response(
     }
     if details is not None:
         error["details"] = details
+    if retry_after_seconds is not None:
+        error["retry_after_seconds"] = retry_after_seconds
     return JSONResponse(status_code=status_code, content={"error": error})
 
 
@@ -38,7 +59,14 @@ def internal_error_response() -> JSONResponse:
 
 
 async def handle_app_error(_request: Request, error: AppError) -> JSONResponse:
-    return error_response(error.status_code, error.code, error.message)
+    # Quota and rate-limit refusals show here as their codes (workspace_quota_exceeded, ...).
+    metrics.inc("app_errors_total", code=error.code, status=error.status_code)
+    response = error_response(
+        error.status_code, error.code, error.message, retry_after_seconds=error.retry_after_seconds
+    )
+    if error.headers:
+        response.headers.update(error.headers)
+    return response
 
 
 async def handle_http_exception(_request: Request, error: StarletteHTTPException) -> JSONResponse:
